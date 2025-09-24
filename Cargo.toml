@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/secenv",
+]
+
+[workspace.package]
+version = "0.0.0"
+authors = ["cchexcode <alexanderh.weber@outlook.com>"]
+edition = "2021"
+license = "MIT"
+homepage = "https://github.com/cchexcode/secenv"
+repository = "https://github.com/cchexcode/secenv"
+description = "Secure environments."
+
+[workspace.dependencies]
+tokio = { version = "1.47.1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "io-util",
+    "time",
+    "sync",
+] }
+async-trait = "0.1.89"
+clap = "4.5.46"
+clap_complete = "4.5.57"
+clap_mangen = "0.2.29"
+clap-markdown = "0.1.5"
+serde = { version = "1.0.219", features = ["derive"] }
+hocon = "0.9"
+anyhow = "1.0.99"
+path-clean = "1.0.1"
+dirs = "6.0"
+rpassword = "7.4"
+base64 = "0.22"
+tempfile = "3.21"
+regex = "1.11"
+semver = "1.0"
+sequoia-openpgp = "2.0.0"
+once_cell = "1.19"
+# proc macro
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
