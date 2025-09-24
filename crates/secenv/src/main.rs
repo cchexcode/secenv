@@ -73,7 +73,37 @@ async fn main() -> Result<()> {
                 ));
             }
 
-            let example_config = "";
+            let example_config = r#"
+version = "0.1.0"
+profiles = {
+  default = {
+    env = {
+      # keep = ["^PATH$", "^LC_.*"]  # Uncomment to only preserve matching host env vars
+      vars = {
+        # Example: hard-coded value
+        APP_NAME.literal = "myapp"
+
+        # Example: from host environment
+        # DB_USER.environment = "USER"
+
+        # Example: from file
+        # SSH_KEY.file = "/home/you/.ssh/id_rsa"
+
+        # Example: from GCP Secret Manager (plain)
+        # DB_PASSWORD.gcp.plain.secret = "projects/myproject/secrets/db_password"
+
+        # Example: decrypt PGP with private key from GCP Secret Manager
+        # SECRET.gcp.pgp.secret = "projects/myproject/secrets/my-pgp-key"
+        # SECRET.gcp.pgp.value.literal = "-----BEGIN PGP MESSAGE-----..."
+
+        # Example: decrypt PGP with base64-encoded message
+        # SECRET2.gcp.pgp.secret = "projects/myproject/secrets/my-pgp-key"
+        # SECRET2.gcp.pgp.value.base64 = "<base64-encoded-ASCII-armored-message>"
+      }
+    }
+  }
+}
+"#;
             
             std::fs::write(&path, example_config)
                 .with_context(|| format!("Failed to write config file: {}", path.display()))?;
