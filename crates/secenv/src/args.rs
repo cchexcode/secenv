@@ -1,5 +1,5 @@
 use {
-    crate::manifest::{Manifest, ManifestProfile},
+    crate::manifest::Manifest,
     anyhow::{
         Context,
         Result,
@@ -46,13 +46,23 @@ impl CallArgs {
 
 #[derive(Debug)]
 pub(crate) enum Command {
-    Manual { path: PathBuf, format: ManualFormat },
-    Autocomplete { path: PathBuf, shell: clap_complete::Shell },
-    Unlock { 
-        profile: ManifestProfile,
+    Manual {
+        path: PathBuf,
+        format: ManualFormat,
+    },
+    Autocomplete {
+        path: PathBuf,
+        shell: clap_complete::Shell,
+    },
+    Unlock {
+        manifest: Manifest,
+        profile_name: String,
         command: Option<Vec<String>>,
     },
-    Init { path: PathBuf, force: bool },
+    Init {
+        path: PathBuf,
+        force: bool,
+    },
 }
 
 pub(crate) struct ClapArgumentLoader {}
@@ -180,22 +190,24 @@ impl ClapArgumentLoader {
                 .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
             let cfg: Manifest = hocon::de::from_str(&hocon_content)
                 .with_context(|| format!("Failed to parse HOCON config: {}", config_path.display()))?;
-            
+
             cfg.validate_version()
                 .with_context(|| format!("Version validation failed for config: {}", config_path.display()))?;
-            
+
             let profile_name = subc.get_one::<String>("profile").unwrap();
 
-            let selected_profile = cfg
-                .profiles
-                .get(profile_name)
-                .with_context(|| format!("Profile '{}' not found in config", profile_name))?;
+            // Validate that the profile exists
+            if !cfg.profiles.contains_key(profile_name) {
+                return Err(anyhow::anyhow!("Profile '{}' not found in config", profile_name));
+            }
 
-            let command = subc.get_many::<String>("command")
+            let command = subc
+                .get_many::<String>("command")
                 .map(|values| values.cloned().collect::<Vec<String>>());
 
             Command::Unlock {
-                profile: selected_profile.clone(),
+                manifest: cfg,
+                profile_name: profile_name.clone(),
                 command,
             }
         } else if let Some(subc) = command.subcommand_matches("init") {

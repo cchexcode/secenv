@@ -1,8 +1,11 @@
 use {
-    anyhow::{Context, Result},
-    std::{
-        collections::HashMap,
-        process::{Command, Stdio},
+    anyhow::{
+        Context,
+        Result,
+    },
+    std::process::{
+        Command,
+        Stdio,
     },
 };
 
@@ -17,7 +20,9 @@ pub struct GcpSecretSpec {
 pub struct GcpSecretManager;
 
 impl GcpSecretManager {
-    pub fn new() -> Result<Self> { Ok(Self) }
+    pub fn new() -> Result<Self> {
+        Ok(Self)
+    }
 
     pub fn access_secret(&self, spec: &GcpSecretSpec) -> Result<String> {
         // Accept fully qualified secret path and optional version.
@@ -28,10 +33,11 @@ impl GcpSecretManager {
             .context("Invalid GCP secret format. Expected 'projects/<project>/secrets/<name>'")?;
 
         let mut cmd = Command::new("gcloud");
-        cmd
-            .args(["secrets", "versions", "access", version, "--quiet"])
-            .arg("--secret").arg(&secret_name)
-            .arg("--project").arg(&project);
+        cmd.args(["secrets", "versions", "access", version, "--quiet"])
+            .arg("--secret")
+            .arg(&secret_name)
+            .arg("--project")
+            .arg(&project);
 
         let output = cmd
             .stdin(Stdio::null())
@@ -48,16 +54,6 @@ impl GcpSecretManager {
         let value = String::from_utf8(output.stdout).context("Secret value is not valid UTF-8")?;
         Ok(value.trim_end_matches(['\n', '\r']).to_string())
     }
-
-    pub fn access_secret_cached_with(&self, cache: &mut HashMap<String, String>, spec: &GcpSecretSpec) -> Result<String> {
-        let cache_key = format!("{}#{}", spec.secret, spec.version.clone().unwrap_or_else(|| "latest".into()));
-        if let Some(val) = cache.get(&cache_key).cloned() {
-            return Ok(val);
-        }
-        let value = self.access_secret(spec)?;
-        cache.insert(cache_key, value.clone());
-        Ok(value)
-    }
 }
 
 fn parse_project_and_secret(fqn: &str) -> Result<(String, String)> {
@@ -72,4 +68,3 @@ fn parse_project_and_secret(fqn: &str) -> Result<(String, String)> {
     let secret_name = parts[3].to_string();
     Ok((project, secret_name))
 }
-

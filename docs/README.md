@@ -206,9 +206,15 @@ For verbose logs:
 RUST_LOG=debug secenv unlock
 ```
 
-## Contributing
+## Testing
 
-PRs are welcome!
+```
+cargo run -- unlock -- env
+```
+
+The password for all private keys for testing is `test`.
+
+## Contributing
 
 ### Development
 

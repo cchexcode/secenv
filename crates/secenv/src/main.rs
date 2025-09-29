@@ -1,6 +1,7 @@
 mod args;
-mod manifest;
 mod gcp;
+mod gpg;
+mod manifest;
 mod pgp;
 mod reference;
 
@@ -10,7 +11,11 @@ use {
         Result,
     },
     args::ManualFormat,
-    std::collections::HashMap,
+    regex::Regex,
+    std::{
+        collections::HashMap,
+        process::Command,
+    },
 };
 
 #[tokio::main]
@@ -37,32 +42,41 @@ async fn main() -> Result<()> {
             crate::reference::build_shell_completion(&path, &shell)?;
             Ok(())
         },
-        | crate::args::Command::Unlock { profile, command } => {
+        | crate::args::Command::Unlock {
+            manifest,
+            profile_name,
+            command,
+        } => {
             let mut env_vars = HashMap::new();
-            let mut secret_cache: HashMap<String, String> = HashMap::new();
-            
+            let mut pgp_manager = crate::pgp::PgpManager::new().context("Failed to initialize PGP manager")?;
+
+            let profile = manifest
+                .profiles
+                .get(profile_name.as_str())
+                .with_context(|| format!("Profile '{}' not found in manifest", profile_name))?;
+
             for (key, value) in profile.env.vars.iter() {
-                match value.get_value_with_cache(&mut secret_cache) {
+                match value.get_value(&mut pgp_manager) {
                     | Ok(val) => {
                         env_vars.insert(key.clone(), val);
                     },
                     | Err(e) => {
-                        eprintln!("Error decrypting {}: {}", key, e);
+                        eprintln!("Error getting value for {}: {}", key, e);
                         return Err(e);
                     },
                 }
             }
 
             match command {
-                Some(cmd_args) if !cmd_args.is_empty() => {
+                | Some(cmd_args) if !cmd_args.is_empty() => {
                     execute_command_with_env(&cmd_args, &env_vars, &profile.env.keep)
                 },
-                _ => {
+                | _ => {
                     for (key, value) in env_vars {
                         println!("{}={}", key, value);
                     }
                     Ok(())
-                }
+                },
             }
         },
         | args::Command::Init { path, force } => {
@@ -75,39 +89,55 @@ async fn main() -> Result<()> {
 
             let example_config = r#"
 version = "0.1.0"
+
 profiles = {
   default = {
     env = {
       # keep = ["^PATH$", "^LC_.*"]  # Uncomment to only preserve matching host env vars
       vars = {
-        # Example: hard-coded value
-        APP_NAME.literal = "myapp"
+        # Example: plain literal value
+        APP_NAME.plain.literal = "myapp"
 
-        # Example: from host environment
-        # DB_USER.environment = "USER"
+        # Example: plain base64-encoded value
+        # DB_HOST.plain.base64 = "bG9jYWxob3N0"  # "localhost" in base64
 
-        # Example: from file
-        # SSH_KEY.file = "/home/you/.ssh/id_rsa"
+        # Example: secure value using PGP secret from file
+        # SECRET_TOKEN.secure {
+        #   secret.pgp.file = "/path/to/private.key"
+        #   value.literal = "-----BEGIN PGP MESSAGE-----..."
+        # }
 
-        # Example: from GCP Secret Manager (plain)
-        # DB_PASSWORD.gcp.plain.secret = "projects/myproject/secrets/db_password"
+        # Example: secure value using PGP secret from GCP
+        # API_KEY.secure {
+        #   secret.pgp.gcp {
+        #     secret = "projects/myproject/secrets/my-pgp-key"
+        #     version = "latest"
+        #   }
+        #   value.base64 = "<base64-encoded-ASCII-armored-message>"
+        # }
 
-        # Example: decrypt PGP with private key from GCP Secret Manager
-        # SECRET.gcp.pgp.secret = "projects/myproject/secrets/my-pgp-key"
-        # SECRET.gcp.pgp.value.literal = "-----BEGIN PGP MESSAGE-----..."
+        # Example: secure value using password from literal
+        # DB_PASSWORD.secure {
+        #   secret.password.literal = "my-decryption-password"
+        #   value.literal = "encrypted-data"
+        # }
 
-        # Example: decrypt PGP with base64-encoded message
-        # SECRET2.gcp.pgp.secret = "projects/myproject/secrets/my-pgp-key"
-        # SECRET2.gcp.pgp.value.base64 = "<base64-encoded-ASCII-armored-message>"
+        # Example: secure value using password from GCP
+        # ENCRYPTION_KEY.secure {
+        #   secret.password.gcp {
+        #     secret = "projects/myproject/secrets/encryption-password"
+        #   }
+        #   value.base64 = "<base64-encoded-encrypted-data>"
+        # }
       }
     }
   }
 }
 "#;
-            
+
             std::fs::write(&path, example_config)
                 .with_context(|| format!("Failed to write config file: {}", path.display()))?;
-            
+
             println!("Created example configuration file: {}", path.display());
             println!("Edit the file to add your own variables and PGP keys.");
             Ok(())
@@ -117,13 +147,10 @@ profiles = {
 
 /// Execute a command with the specified environment variables
 fn execute_command_with_env(
-    cmd_args: &[String], 
-    env_vars: &HashMap<String, String>, 
-    keep_env_vars: &Option<Vec<String>>
+    cmd_args: &[String],
+    env_vars: &HashMap<String, String>,
+    keep_env_vars: &Option<Vec<String>>,
 ) -> Result<()> {
-    use std::process::Command;
-    use regex::Regex;
-    
     if cmd_args.is_empty() {
         return Err(anyhow::anyhow!("No command provided"));
     }
@@ -135,22 +162,18 @@ fn execute_command_with_env(
     command.args(args);
 
     match keep_env_vars {
-        None => {
+        | None => {
             for (key, value) in env_vars {
                 command.env(key, value);
             }
-        }
-        Some(patterns) => {
+        },
+        | Some(patterns) => {
             command.env_clear();
-            
-            let compiled_patterns: Result<Vec<Regex>, _> = patterns
-                .iter()
-                .map(|pattern| Regex::new(pattern))
-                .collect();
-            
-            let compiled_patterns = compiled_patterns
-                .with_context(|| "Failed to compile regex patterns")?;
-            
+
+            let compiled_patterns: Result<Vec<Regex>, _> = patterns.iter().map(|pattern| Regex::new(pattern)).collect();
+
+            let compiled_patterns = compiled_patterns.with_context(|| "Failed to compile regex patterns")?;
+
             for (env_key, env_value) in std::env::vars() {
                 for pattern in &compiled_patterns {
                     if pattern.is_match(&env_key) {
@@ -159,14 +182,15 @@ fn execute_command_with_env(
                     }
                 }
             }
-            
+
             for (key, value) in env_vars {
                 command.env(key, value);
             }
-        }
+        },
     }
 
-    let status = command.status()
+    let status = command
+        .status()
         .with_context(|| format!("Failed to execute command: {}", program))?;
 
     if !status.success() {

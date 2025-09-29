@@ -1,12 +1,70 @@
 use {
     crate::{
-        gcp::{GcpSecretManager, GcpSecretSpec},
-        pgp::PgpManager,
-    }, anyhow::{Context, Result}, base64::Engine, semver::Version, serde::{
+        gcp::{
+            GcpSecretManager,
+            GcpSecretSpec,
+        },
+        gpg::{
+            GpgKeySpec,
+            GpgManager,
+        },
+    },
+    anyhow::{
+        Context,
+        Result,
+    },
+    base64::Engine,
+    semver::Version,
+    serde::{
         Deserialize,
         Serialize,
-    }, std::collections::HashMap,
+    },
+    std::collections::HashMap,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncodedValue {
+    Literal(String),
+    Base64(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EncodedValueWrapper {
+    #[serde(flatten)]
+    pub inner: EncodedValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretAllocation {
+    Literal(EncodedValue),
+    File(String),
+    Gpg { fingerprint: String },
+    Gcp { secret: String, version: Option<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SecretAllocationWrapper {
+    #[serde(flatten)]
+    pub inner: SecretAllocation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Secret {
+    #[serde(rename = "pgp")]
+    PGP(SecretAllocationWrapper),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SecretWrapper {
+    #[serde(flatten)]
+    pub inner: Secret,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,112 +84,103 @@ pub struct ManifestProfile {
 pub struct ManifestEnv {
     #[serde(default)]
     pub keep: Option<Vec<String>>,
-    pub vars: HashMap<String, ValueProvider>,
+    pub vars: HashMap<String, ManifestEnvVar>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StringValue {
-    Base64(String),
-    Literal(String),
+pub enum ManifestEnvVar {
+    Plain(EncodedValue),
+    Secure {
+        secret: SecretWrapper,
+        value: EncodedValueWrapper,
+    },
 }
 
-impl StringValue {
+impl EncodedValue {
     pub fn get_value(&self) -> Result<String, anyhow::Error> {
         match self {
-            StringValue::Literal(value) => Ok(value.clone()),
-            StringValue::Base64(value) => {
-                Ok(String::from_utf8(base64::engine::general_purpose::STANDARD.decode(value).context("Failed to decode base64 value")?)
-                    .context("Decoded value is not valid UTF-8")?)
-            }
+            | EncodedValue::Literal(value) => Ok(value.clone()),
+            | EncodedValue::Base64(value) => {
+                let decoded_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .context("Failed to decode base64 value")?;
+
+                Ok(String::from_utf8(decoded_bytes).context("Decoded value is not valid UTF-8")?)
+            },
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GcpValue {
-    Plain {
-        secret: String,
-    },
-    Pgp {
-        secret: String,
-        value: StringValue,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValueProvider {
-    Literal(String),
-    Environment(String),
-    File(String),
-    #[serde(rename = "pgp")]
-    PGP {
-        key: String,
-        value: StringValue,
-    },
-    Gcp(GcpProvider),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct GcpProvider {
-    #[serde(flatten)]
-    pub inner: GcpValue,
-}
-
-impl ValueProvider {
-    pub fn get_value_with_cache(&self, gcp_secrets: &mut std::collections::HashMap<String, String>) -> Result<String, anyhow::Error> {
+impl SecretAllocation {
+    pub fn get_value(&self) -> Result<String, anyhow::Error> {
         match self {
-            | ValueProvider::Literal(value) => Ok(value.clone()),
-            | ValueProvider::Environment(value) => {
-                Ok(std::env::var(value).context(format!("Failed to get environment variable: {}", value))?)
+            | SecretAllocation::Literal(encoded_value) => encoded_value.get_value(),
+            | SecretAllocation::File(file_path) => {
+                std::fs::read_to_string(file_path).context(format!("Failed to read file: {}", file_path))
             },
-            | ValueProvider::File(value) => {
-                Ok(std::fs::read_to_string(value).context(format!("Failed to read file: {}", value))?)
+            | SecretAllocation::Gpg { fingerprint } => {
+                let gpg = GpgManager::new().context("Failed to initialize GPG manager")?;
+                let spec = GpgKeySpec {
+                    fingerprint: fingerprint.clone(),
+                };
+                gpg.export_private_key(&spec)
+                    .context("Failed to export GPG private key")
             },
-            | ValueProvider::PGP { key, value } => {
-                let pgp_manager = PgpManager::new().context("Failed to initialize PGP manager")?;
+            | SecretAllocation::Gcp { secret, version } => {
+                let gcp = GcpSecretManager::new().context("Failed to initialize GCP Secret Manager client")?;
+                let spec = GcpSecretSpec {
+                    secret: secret.clone(),
+                    version: version.clone(),
+                };
+                gcp.access_secret(&spec).context("Failed to access GCP secret")
+            },
+        }
+    }
+}
 
-                pgp_manager
-                    .decrypt(key, &value.get_value()?)
-                    .context(format!("Failed to decrypt value using PGP key {}", key))
-            },
-            | ValueProvider::Gcp(provider) => {
-                match &provider.inner {
-                    GcpValue::Plain { secret } => {
-                        let gcp = GcpSecretManager::new().context("Failed to initialize GCP Secret Manager client")?;
-                        let spec = GcpSecretSpec { secret: secret.clone(), version: None };
-                        gcp.access_secret_cached_with(gcp_secrets, &spec).context("Failed to access GCP secret")
-                    }
-                    GcpValue::Pgp { secret, value } => {
-                        let gcp = GcpSecretManager::new().context("Failed to initialize GCP Secret Manager client")?;
-                        let spec = GcpSecretSpec { secret: secret.clone(), version: None };
-                        let key = gcp.access_secret_cached_with(gcp_secrets, &spec).context("Failed to access GCP secret for PGP key")?;
-                        let pgp_manager = PgpManager::new().context("Failed to initialize PGP manager")?;
-                        pgp_manager
-                            .decrypt_with_private_key(&key, &value.get_value()?)
-                            .context("Failed to decrypt value with provided PGP private key")
-                    }
+impl ManifestEnvVar {
+    pub fn get_value(&self, pgp_manager: &mut crate::pgp::PgpManager) -> Result<String, anyhow::Error> {
+        match self {
+            | ManifestEnvVar::Plain(encoded_value) => encoded_value.get_value(),
+            | ManifestEnvVar::Secure { secret, value } => {
+                let encrypted_data = value.inner.get_value()?;
+
+                match &secret.inner {
+                    | Secret::PGP(allocation_wrapper) => {
+                        match &allocation_wrapper.inner {
+                            | SecretAllocation::Gpg { fingerprint: _ } => {
+                                // Use GPG directly for decryption when gpg variant is specified
+                                let gpg = GpgManager::new().context("Failed to initialize GPG manager")?;
+                                gpg.decrypt_data(&encrypted_data)
+                                    .context("Failed to decrypt value with GPG")
+                            },
+                            | _ => {
+                                // For file-based or other PGP keys, use Sequoia-OpenPGP
+                                let pgp_key = allocation_wrapper.inner.get_value()?;
+                                pgp_manager
+                                    .decrypt(&pgp_key, &encrypted_data)
+                                    .context("Failed to decrypt value with PGP key")
+                            },
+                        }
+                    },
                 }
-            }
+            },
         }
     }
 }
 
 impl Manifest {
     pub fn validate_version(&self) -> Result<()> {
-        let cli_version = Version::parse(env!("CARGO_PKG_VERSION"))
-            .context("Failed to parse CLI version")?;
+        let cli_version = Version::parse(env!("CARGO_PKG_VERSION")).context("Failed to parse CLI version")?;
 
         if env!("CARGO_PKG_VERSION") == "0.0.0" {
             return Ok(());
         }
-        
-        let config_version = Version::parse(&self.version)
-            .context(format!("Invalid version format in config: '{}'", self.version))?;
-        
+
+        let config_version =
+            Version::parse(&self.version).context(format!("Invalid version format in config: '{}'", self.version))?;
+
         if config_version.major != cli_version.major {
             return Err(anyhow::anyhow!(
                 "Config version {} is incompatible with CLI version {}. Major version mismatch.",
@@ -139,7 +188,7 @@ impl Manifest {
                 cli_version
             ));
         }
-        
+
         if config_version > cli_version {
             return Err(anyhow::anyhow!(
                 "Config version {} is newer than CLI version {}. Please upgrade the CLI.",
@@ -147,15 +196,14 @@ impl Manifest {
                 cli_version
             ));
         }
-        
+
         if config_version.minor > cli_version.minor {
             eprintln!(
                 "Warning: Config version {} has newer minor version than CLI version {}. Some features may not work.",
-                config_version,
-                cli_version
+                config_version, cli_version
             );
         }
-        
+
         Ok(())
     }
 }
