@@ -107,27 +107,21 @@ profiles = {
         #   value.literal = "-----BEGIN PGP MESSAGE-----..."
         # }
 
-        # Example: secure value using PGP secret from GCP
+        # Example: secure value using PGP secret from GCP (fully qualified resource)
         # API_KEY.secure {
-        #   secret.pgp.gcp {
-        #     secret = "projects/myproject/secrets/my-pgp-key"
-        #     version = "latest"
-        #   }
+        #   secret.pgp.gcp.secret = "projects/myproject/secrets/my-pgp-key"
+        #   # secret.pgp.gcp.version = "latest"  # optional
         #   value.base64 = "<base64-encoded-ASCII-armored-message>"
         # }
 
-        # Example: secure value using password from literal
-        # DB_PASSWORD.secure {
-        #   secret.password.literal = "my-decryption-password"
-        #   value.literal = "encrypted-data"
-        # }
-
-        # Example: secure value using password from GCP
-        # ENCRYPTION_KEY.secure {
-        #   secret.password.gcp {
-        #     secret = "projects/myproject/secrets/encryption-password"
-        #   }
-        #   value.base64 = "<base64-encoded-encrypted-data>"
+        # Example: secure value using inline private key
+        # ENCRYPTED_TOKEN.secure {
+        #   secret.pgp.literal.literal = """
+        #   -----BEGIN PGP PRIVATE KEY BLOCK-----
+        #   ...
+        #   -----END PGP PRIVATE KEY BLOCK-----
+        #   """
+        #   value.literal = "-----BEGIN PGP MESSAGE-----..."
         # }
       }
     }

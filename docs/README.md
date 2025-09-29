@@ -1,13 +1,12 @@
 # secenv
 
-Secure, profile-based environment variable management with HOCON configuration, optional PGP decryption, and GCP Secret Manager integration.
+Secure, profile-based environment variable management with HOCON configuration, PGP decryption, and optional GCP Secret Manager integration for retrieving PGP private keys.
 
 ## Features
 
-- 🔐 **PGP decryption (with provided private key)**: Decrypt values using an ASCII-armored private key you supply
-- ☁️ **GCP Secret Manager**: Load secrets at runtime using `gcloud`
+- 🔐 **PGP decryption**: Decrypt PGP-encrypted values using a private key provided via file, literal, GPG keyring (by fingerprint), or GCP Secret Manager
+- ☁️ **GCP Secret Manager**: Fetch the PGP private key at runtime via `gcloud`
 - 🗂️ **Profiles**: Organize variables by profile (dev, staging, prod, …)
-- 🧩 **Multiple providers**: `literal`, `environment`, `file`, `gcp.plain`, `gcp.pgp`
 - 🧪 **Docs & tooling**: Built-in manual and shell completion generators
 - ⚡ **Fast & safe**: Rust-based CLI
 
@@ -28,27 +27,32 @@ The binary will be at `target/release/secenv`.
 ### 1) Create `secenv.conf` (HOCON)
 
 ```hocon
-version = "0.0.0"  # Config version must be compatible with the CLI version
+version = "0.0.0"  # Must be semver and compatible with the CLI version
 
 profiles.default.env {
-  # Optional regex patterns of variables to keep when executing a command
+  # Optional regex patterns of variables to keep when executing a command.
   # If set, the child environment is cleared first, then only matching host vars are kept.
   # If omitted, the full host environment is kept.
   # keep = ["^PATH$", "^SHELL$", "^LC_.*"]
 
   vars {
-    APP_NAME.literal = "myapp"
-    HOME_DIR.environment = "HOME"
-    CONFIG_JSON.file = "/etc/myapp/config.json"
+    # Plain inline values
+    APP_NAME.plain.literal = "myapp"
+    # DB_HOST.plain.base64 = "bG9jYWxob3N0"  # "localhost"
 
-    # Retrieve a secret value directly from GCP Secret Manager (plain text)
-    DB_PASSWORD.gcp.plain.secret = "projects/123456789/secrets/db-password"
+    # Secure PGP-decrypted value using a GPG key from local keyring by fingerprint
+    SECRET_TOKEN.secure {
+      secret.pgp.gpg.fingerprint = "1E1BAC706C352094D490D5393F5167F1F3002043"
+      value.base64 = "<base64-encoded ASCII-armored PGP message>"
+    }
 
-    # Decrypt a PGP-encrypted value using a private key stored in GCP Secret Manager
-    # - secret: GCP secret holding the ASCII-armored private key
-    # - value.literal: ASCII-armored PGP message (or use value.base64)
-    SERVICE_TOKEN.gcp.pgp {
-      secret = "projects/123456789/secrets/pgp-private-key"
+    # Secure PGP-decrypted value using a private key stored in GCP Secret Manager
+    # secret.pgp.gcp.secret must be a fully qualified resource:
+    #   projects/<project>/secrets/<name>[/versions/<version>]
+    # version defaults to "latest" if omitted.
+    SERVICE_TOKEN.secure {
+      secret.pgp.gcp.secret = "projects/123456789/secrets/pgp-private-key"
+      # secret.pgp.gcp.version = "latest"  # optional
       value.literal = """
       -----BEGIN PGP MESSAGE-----
       ...
@@ -57,16 +61,11 @@ profiles.default.env {
     }
   }
 }
-
-profiles.production.env.vars {
-  APP_NAME.literal = "myapp"
-  DB_PASSWORD.gcp.plain.secret = "projects/123456789/secrets/prod-db-password"
-}
 ```
 
 Notes:
-- The `version` field is validated against the CLI version. The config must not be newer than the CLI, and major versions must match.
-- For `gcp.pgp`, the private key must be a valid ASCII‑armored OpenPGP private key stored in GCP Secret Manager.
+- The `version` field is validated against the CLI version. The config cannot be newer than the CLI, and major versions must match.
+- Supported secret sources for PGP private keys: `secret.pgp.literal`, `secret.pgp.file`, `secret.pgp.gpg.fingerprint`, `secret.pgp.gcp.secret` (+ optional `.version`).
 
 ### 2) Unlock variables
 
@@ -97,8 +96,7 @@ secenv unlock --profile production -- make deploy
 Output format when printing:
 ```
 APP_NAME=myapp
-DB_PASSWORD=...
-HOME_DIR=/Users/you
+SECRET_TOKEN=...
 ```
 
 ## Configuration reference (HOCON)
@@ -115,31 +113,45 @@ profiles = { <name> = { env = { keep = [<regex>], vars = { ... } } } }
 ```hocon
 profiles.<profile>.env.keep = ["^PATH$", "^LC_.*"]  # optional
 profiles.<profile>.env.vars {                          # required
-  KEY.literal = "value"
-  KEY.environment = "ENV_NAME"
-  KEY.file = "/path/to/file"
+  # Plain values (inline only)
+  KEY.plain.literal = "value"
+  KEY.plain.base64  = "<base64-encoded string>"
 
-  # From GCP Secret Manager (plain)
-  KEY.gcp.plain.secret = "projects/<project>/secrets/<name>"
+  # Secure values (PGP-decrypted)
+  KEY.secure {
+    # One of the following PGP private key sources:
+    # Inline (EncodedValue): choose one encoding
+    # secret.pgp.literal.literal = """
+    # -----BEGIN PGP PRIVATE KEY BLOCK-----
+    # ...
+    # -----END PGP PRIVATE KEY BLOCK-----
+    # """
+    # or
+    # secret.pgp.literal.base64 = "<base64-encoded ASCII-armored private key>"
+    # OR
+    # secret.pgp.file = "/path/to/private.key"
+    # OR
+    # secret.pgp.gpg.fingerprint = "<fingerprint>"
+    # OR
+    # secret.pgp.gcp.secret = "projects/<project>/secrets/<name>"
+    # secret.pgp.gcp.version = "latest"  # optional
 
-  # Decrypt PGP with a private key retrieved from GCP Secret Manager
-  KEY.gcp.pgp.secret = "projects/<project>/secrets/<private-key>"
-  KEY.gcp.pgp.value.literal = "-----BEGIN PGP MESSAGE-----..."
-  # or
-  KEY.gcp.pgp.value.base64 = "<base64-encoded-ASCII-armored-message>"
+    # Encrypted value to decrypt (ASCII-armored PGP message)
+    value.literal = "-----BEGIN PGP MESSAGE-----..."
+    # or
+    # value.base64 = "<base64-encoded-ASCII-armored-message>"
+  }
 }
 ```
 
 ### Providers
 
-- **literal**: Hard-coded string
-- **environment**: Reads an existing host environment variable
-- **file**: Reads file contents as string
-- **gcp.plain**: Reads a secret value directly from GCP Secret Manager
-- **gcp.pgp**: Fetches a private key from GCP Secret Manager and decrypts a PGP message you provide
+- **plain**: Inline string value via `literal` or `base64`
+- **secure**: Decrypts a PGP message using a provided PGP private key (`secret.pgp.*`)
 
 Important:
-- Decryption by fingerprint/key ID is not supported. You must provide a private key for decryption (e.g., via `gcp.pgp`).
+- Reading plain values from files or environment variables is not supported in the new manifest. Provide plain values inline via `literal`/`base64`.
+- Decryption via GPG keyring is supported only by specifying a `fingerprint`.
 
 ## CLI reference
 
@@ -185,7 +197,7 @@ secenv init [--path <path>] [--force]
 ```
 
 Notes:
-- Creates an empty file at `--path` (default: `secenv.conf`). You should edit it to add `version`, `profiles`, and `vars` as shown above.
+- Creates an example file at `--path` (default: `secenv.conf`). Review and adapt it to add your `version`, `profiles`, and `vars` as shown above.
 
 ## GCP requirements
 
@@ -195,10 +207,10 @@ Notes:
 
 ## Troubleshooting
 
-- **"Profile '<name>' not found"**: Verify `profiles.<name>` exists in the config.
-- **"Failed to parse HOCON config"**: Validate HOCON syntax and file path.
-- **GCP access errors**: Check `gcloud` authentication, project, permissions, and secret name.
-- **PGP decryption errors**: Ensure the private key is valid ASCII‑armored and corresponds to the message.
+- "Profile '<name>' not found": Verify `profiles.<name>` exists in the config.
+- "Failed to parse HOCON config": Validate HOCON syntax and file path.
+- GCP access errors: Check `gcloud` authentication, project, permissions, and secret name.
+- PGP decryption errors: Ensure the private key is valid ASCII‑armored and corresponds to the message.
 
 For verbose logs:
 
