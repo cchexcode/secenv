@@ -21,10 +21,7 @@ impl GpgManager {
         Ok(Self)
     }
 
-    /// Export a GPG private key by fingerprint using the gpg CLI
     pub fn export_private_key(&self, spec: &GpgKeySpec) -> Result<String> {
-        // Use gpg --export-secret-keys to get the private key in ASCII armor format
-        // Try different export options for better Sequoia OpenPGP compatibility
         let mut cmd = Command::new("gpg");
         cmd.args([
             "--export-secret-keys",
@@ -61,7 +58,6 @@ impl GpgManager {
         Ok(private_key)
     }
 
-    /// Decrypt PGP encrypted data using GPG directly
     pub fn decrypt_data(&self, encrypted_data: &str) -> Result<String> {
         let mut cmd = Command::new("gpg");
         cmd.args(["--decrypt", "--batch", "--quiet"]);
@@ -73,7 +69,6 @@ impl GpgManager {
             .spawn()
             .context("Failed to spawn gpg process for decryption")?;
 
-        // Write encrypted data to stdin
         if let Some(stdin) = child.stdin.take() {
             use std::io::Write;
             let mut stdin = stdin;

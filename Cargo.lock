@@ -1721,6 +1721,7 @@ dependencies = [
  "semver",
  "sequoia-openpgp",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

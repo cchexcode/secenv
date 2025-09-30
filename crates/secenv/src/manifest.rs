@@ -74,28 +74,49 @@ pub struct Manifest {
     pub profiles: HashMap<String, ManifestProfile>,
 }
 
+/// Profile configuration containing temporary files and environment variables
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ManifestProfile {
+    /// Temporary files to create before command execution and cleanup
+    /// afterwards. Files can contain plain or secure (PGP-encrypted)
+    /// content. The key is the file path, and the value is the file
+    /// content.
     #[serde(default)]
     pub files: HashMap<String, ContentWrapper>,
+
+    /// Environment configuration including variables and keep patterns
     #[serde(default)]
     pub env: ManifestEnv,
 }
 
+/// Environment configuration for a profile
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct ManifestEnv {
+    /// Optional regex patterns to filter which host environment variables to
+    /// keep when executing commands. If specified, the environment is
+    /// cleared first, then only matching variables are preserved.
     #[serde(default)]
     pub keep: Option<Vec<String>>,
+
+    /// Environment variables to set. Variables can be plain or secure
+    /// (PGP-encrypted).
     #[serde(default)]
     pub vars: HashMap<String, ContentWrapper>,
 }
 
+/// Content that can be either plain text or PGP-encrypted.
+/// Used for both environment variables and temporary files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Content {
+    /// Plain content encoded as literal string or base64
     Plain(EncodedValue),
+
+    /// Secure content that requires PGP decryption.
+    /// The secret specifies how to obtain the PGP private key,
+    /// and the value is the encrypted content to decrypt.
     Secure {
         secret: SecretWrapper,
         value: EncodedValueWrapper,

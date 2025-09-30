@@ -204,7 +204,6 @@ impl ClapArgumentLoader {
 
             let profile_name = subc.get_one::<String>("profile").unwrap();
 
-            // Validate that the profile exists
             if !cfg.profiles.contains_key(profile_name) {
                 return Err(anyhow::anyhow!("Profile '{}' not found in config", profile_name));
             }

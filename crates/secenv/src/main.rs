@@ -11,11 +11,24 @@ use {
         Result,
     },
     args::ManualFormat,
+    manifest::{
+        Content,
+        ContentWrapper,
+        EncodedValue,
+        EncodedValueWrapper,
+        Manifest,
+        ManifestEnv,
+        ManifestProfile,
+        Secret,
+        SecretAllocation,
+        SecretAllocationWrapper,
+        SecretWrapper,
+    },
     regex::Regex,
     std::{
         collections::HashMap,
-        process::Command,
         path::Path,
+        process::Command,
     },
 };
 
@@ -43,7 +56,12 @@ async fn main() -> Result<()> {
             crate::reference::build_shell_completion(&path, &shell)?;
             Ok(())
         },
-        | crate::args::Command::Unlock { manifest, profile_name, command, force } => {
+        | crate::args::Command::Unlock {
+            manifest,
+            profile_name,
+            command,
+            force,
+        } => {
             let mut env_vars = HashMap::new();
             let mut pgp_manager = crate::pgp::PgpManager::new().context("Failed to initialize PGP manager")?;
 
@@ -63,8 +81,6 @@ async fn main() -> Result<()> {
                     },
                 }
             }
-
-            // Prepare files from manifest before running command
             let mut created_files: Vec<String> = Vec::new();
             for (file_path, content) in profile.files.iter() {
                 let absolute_path = Path::new(file_path);
@@ -74,7 +90,6 @@ async fn main() -> Result<()> {
                         absolute_path.display()
                     ));
                 }
-
                 let value = content.inner.get_value(&mut pgp_manager)?;
                 if let Some(parent) = absolute_path.parent() {
                     std::fs::create_dir_all(parent)
@@ -87,7 +102,7 @@ async fn main() -> Result<()> {
 
             let exec_status: Result<Option<std::process::ExitStatus>> = match command {
                 | Some(cmd_args) if !cmd_args.is_empty() => {
-                    let status = execute_command_with_env(&cmd_args, &env_vars, &profile.env.keep)?;
+                    let status = exec_command(&cmd_args, &env_vars, &profile.env.keep)?;
                     Ok(Some(status))
                 },
                 | _ => {
@@ -98,15 +113,10 @@ async fn main() -> Result<()> {
                 },
             };
 
-            // Cleanup files after command execution or printing envs
             let mut cleanup_error: Option<anyhow::Error> = None;
             for file in created_files.iter() {
                 if let Err(e) = std::fs::remove_file(file) {
-                    cleanup_error = Some(anyhow::anyhow!(
-                        "Failed to remove file '{}': {}",
-                        file,
-                        e
-                    ));
+                    cleanup_error = Some(anyhow::anyhow!("Failed to remove file '{}': {}", file, e));
                 }
             }
 
@@ -136,60 +146,110 @@ async fn main() -> Result<()> {
                 ));
             }
 
-            let example_config = r#"
-version = "0.1.0"
+            let mut profiles = HashMap::new();
+            let mut vars = HashMap::new();
 
-profiles = {
-  default = {
-    env = {
-      # keep = ["^PATH$", "^LC_.*"]  # Uncomment to only preserve matching host env vars
-      vars = {
-        # Example: plain literal value
-        APP_NAME.plain.literal = "myapp"
+            vars.insert("APP_NAME".to_string(), ContentWrapper {
+                inner: Content::Plain(EncodedValue::Literal("myapp".to_string())),
+            });
 
-        # Example: plain base64-encoded value
-        # DB_HOST.plain.base64 = "bG9jYWxob3N0"  # "localhost" in base64
+            vars.insert("DB_HOST_EXAMPLE".to_string(), ContentWrapper {
+                inner: Content::Plain(EncodedValue::Base64("bG9jYWxob3N0".to_string())),
+            });
 
-        # Example: secure value using PGP secret from file
-        # SECRET_TOKEN.secure {
-        #   secret.pgp.file = "/path/to/private.key"
-        #   value.literal = "-----BEGIN PGP MESSAGE-----..."
-        # }
+            vars.insert("SECRET_TOKEN_EXAMPLE".to_string(), ContentWrapper {
+                inner: Content::Secure {
+                    secret: SecretWrapper {
+                        inner: Secret::PGP(SecretAllocationWrapper {
+                            inner: SecretAllocation::File("/path/to/private.key".to_string()),
+                        }),
+                    },
+                    value: EncodedValueWrapper {
+                        inner: EncodedValue::Literal("-----BEGIN PGP MESSAGE-----...".to_string()),
+                    },
+                },
+            });
 
-        # Example: secure value using PGP secret from GCP (fully qualified resource)
-        # API_KEY.secure {
-        #   secret.pgp.gcp.secret = "projects/myproject/secrets/my-pgp-key"
-        #   # secret.pgp.gcp.version = "latest"  # optional
-        #   value.base64 = "<base64-encoded-ASCII-armored-message>"
-        # }
+            vars.insert("API_KEY_EXAMPLE".to_string(), ContentWrapper {
+                inner: Content::Secure {
+                    secret: SecretWrapper {
+                        inner: Secret::PGP(SecretAllocationWrapper {
+                            inner: SecretAllocation::Gcp {
+                                secret: "projects/myproject/secrets/my-pgp-key".to_string(),
+                                version: Some("latest".to_string()),
+                            },
+                        }),
+                    },
+                    value: EncodedValueWrapper {
+                        inner: EncodedValue::Base64("<base64-encoded-ASCII-armored-message>".to_string()),
+                    },
+                },
+            });
 
-        # Example: secure value using inline private key
-        # ENCRYPTED_TOKEN.secure {
-        #   secret.pgp.literal.literal = """
-        #   -----BEGIN PGP PRIVATE KEY BLOCK-----
-        #   ...
-        #   -----END PGP PRIVATE KEY BLOCK-----
-        #   """
-        #   value.literal = "-----BEGIN PGP MESSAGE-----..."
-        # }
-      }
-    }
-  }
-}
-"#;
+            vars.insert("GPG_ENCRYPTED_EXAMPLE".to_string(), ContentWrapper {
+                inner: Content::Secure {
+                    secret: SecretWrapper {
+                        inner: Secret::PGP(SecretAllocationWrapper {
+                            inner: SecretAllocation::Gpg {
+                                fingerprint: "1E1BAC706C352094D490D5393F5167F1F3002043".to_string(),
+                            },
+                        }),
+                    },
+                    value: EncodedValueWrapper {
+                        inner: EncodedValue::Base64("<base64-encoded-ASCII-armored-message>".to_string()),
+                    },
+                },
+            });
 
-            std::fs::write(&path, example_config)
+            let mut files = HashMap::new();
+
+            files.insert("./config.json".to_string(), ContentWrapper {
+                inner: Content::Plain(EncodedValue::Literal("{\"key\": \"value\"}".to_string())),
+            });
+
+            files.insert("./credentials.key".to_string(), ContentWrapper {
+                inner: Content::Secure {
+                    secret: SecretWrapper {
+                        inner: Secret::PGP(SecretAllocationWrapper {
+                            inner: SecretAllocation::File("/path/to/private.key".to_string()),
+                        }),
+                    },
+                    value: EncodedValueWrapper {
+                        inner: EncodedValue::Literal("-----BEGIN PGP MESSAGE-----...".to_string()),
+                    },
+                },
+            });
+
+            let default_profile = ManifestProfile {
+                files,
+                env: ManifestEnv {
+                    keep: Some(vec!["^PATH$".to_string(), "^LC_.*".to_string()]),
+                    vars,
+                },
+            };
+
+            profiles.insert("default".to_string(), default_profile);
+
+            let manifest = Manifest {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                profiles,
+            };
+
+            let json_config =
+                serde_json::to_string_pretty(&manifest).context("Failed to serialize example config to JSON")?;
+
+            std::fs::write(&path, json_config)
                 .with_context(|| format!("Failed to write config file: {}", path.display()))?;
 
             println!("Created example configuration file: {}", path.display());
             println!("Edit the file to add your own variables and PGP keys.");
+            println!("Note: Remove '_EXAMPLE' suffix from variable names before using them.");
             Ok(())
         },
     }
 }
 
-/// Execute a command with the specified environment variables
-fn execute_command_with_env(
+fn exec_command(
     cmd_args: &[String],
     env_vars: &HashMap<String, String>,
     keep_env_vars: &Option<Vec<String>>,
