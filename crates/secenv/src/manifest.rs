@@ -79,6 +79,7 @@ pub struct Manifest {
 pub struct ManifestProfile {
     #[serde(default)]
     pub files: HashMap<String, ContentWrapper>,
+
     #[serde(default)]
     pub env: ManifestEnv,
 }
@@ -88,6 +89,7 @@ pub struct ManifestProfile {
 pub struct ManifestEnv {
     #[serde(default)]
     pub keep: Option<Vec<String>>,
+
     #[serde(default)]
     pub vars: HashMap<String, ContentWrapper>,
 }
@@ -96,6 +98,7 @@ pub struct ManifestEnv {
 #[serde(rename_all = "snake_case")]
 pub enum Content {
     Plain(EncodedValue),
+
     Secure {
         secret: SecretWrapper,
         value: EncodedValueWrapper,
@@ -162,13 +165,11 @@ impl Content {
                     | Secret::PGP(allocation_wrapper) => {
                         match &allocation_wrapper.inner {
                             | SecretAllocation::Gpg { fingerprint: _ } => {
-                                // Use GPG directly for decryption when gpg variant is specified
                                 let gpg = GpgManager::new().context("Failed to initialize GPG manager")?;
                                 gpg.decrypt_data(&encrypted_data)
                                     .context("Failed to decrypt value with GPG")
                             },
                             | _ => {
-                                // For file-based or other PGP keys, use Sequoia-OpenPGP
                                 let pgp_key = allocation_wrapper.inner.get_value()?;
                                 pgp_manager
                                     .decrypt(&pgp_key, &encrypted_data)

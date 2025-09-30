@@ -21,6 +21,7 @@ clap_complete = { workspace = true }
 clap_mangen = { workspace = true }
 clap-markdown = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 hocon = { workspace = true }
 anyhow = { workspace = true }
 path-clean = { workspace = true }
