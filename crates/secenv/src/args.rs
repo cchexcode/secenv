@@ -58,6 +58,7 @@ pub(crate) enum Command {
         manifest: Manifest,
         profile_name: String,
         command: Option<Vec<String>>,
+        force: bool,
     },
     Init {
         path: PathBuf,
@@ -132,6 +133,13 @@ impl ClapArgumentLoader {
                             .default_value("default"),
                     )
                     .arg(
+                        clap::Arg::new("force")
+                            .short('f')
+                            .long("force")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Overwrite existing files defined in the manifest"),
+                    )
+                    .arg(
                         clap::Arg::new("command")
                             .help("Command to execute with environment variables set")
                             .num_args(0..)
@@ -204,11 +212,13 @@ impl ClapArgumentLoader {
             let command = subc
                 .get_many::<String>("command")
                 .map(|values| values.cloned().collect::<Vec<String>>());
+            let force = subc.get_flag("force");
 
             Command::Unlock {
                 manifest: cfg,
                 profile_name: profile_name.clone(),
                 command,
+                force,
             }
         } else if let Some(subc) = command.subcommand_matches("init") {
             let config_path = Self::get_absolute_path(subc, "path")?;

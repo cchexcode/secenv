@@ -70,31 +70,43 @@ pub struct SecretWrapper {
 #[serde(rename_all = "snake_case")]
 pub struct Manifest {
     pub version: String,
+    #[serde(default)]
     pub profiles: HashMap<String, ManifestProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ManifestProfile {
+    #[serde(default)]
+    pub files: HashMap<String, ContentWrapper>,
+    #[serde(default)]
     pub env: ManifestEnv,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct ManifestEnv {
     #[serde(default)]
     pub keep: Option<Vec<String>>,
-    pub vars: HashMap<String, ManifestEnvVar>,
+    #[serde(default)]
+    pub vars: HashMap<String, ContentWrapper>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ManifestEnvVar {
+pub enum Content {
     Plain(EncodedValue),
     Secure {
         secret: SecretWrapper,
         value: EncodedValueWrapper,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ContentWrapper {
+    #[serde(flatten)]
+    pub inner: Content,
 }
 
 impl EncodedValue {
@@ -139,11 +151,11 @@ impl SecretAllocation {
     }
 }
 
-impl ManifestEnvVar {
+impl Content {
     pub fn get_value(&self, pgp_manager: &mut crate::pgp::PgpManager) -> Result<String, anyhow::Error> {
         match self {
-            | ManifestEnvVar::Plain(encoded_value) => encoded_value.get_value(),
-            | ManifestEnvVar::Secure { secret, value } => {
+            | Content::Plain(encoded_value) => encoded_value.get_value(),
+            | Content::Secure { secret, value } => {
                 let encrypted_data = value.inner.get_value()?;
 
                 match &secret.inner {

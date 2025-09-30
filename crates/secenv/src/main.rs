@@ -15,6 +15,7 @@ use {
     std::{
         collections::HashMap,
         process::Command,
+        path::Path,
     },
 };
 
@@ -42,11 +43,7 @@ async fn main() -> Result<()> {
             crate::reference::build_shell_completion(&path, &shell)?;
             Ok(())
         },
-        | crate::args::Command::Unlock {
-            manifest,
-            profile_name,
-            command,
-        } => {
+        | crate::args::Command::Unlock { manifest, profile_name, command, force } => {
             let mut env_vars = HashMap::new();
             let mut pgp_manager = crate::pgp::PgpManager::new().context("Failed to initialize PGP manager")?;
 
@@ -56,7 +53,7 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("Profile '{}' not found in manifest", profile_name))?;
 
             for (key, value) in profile.env.vars.iter() {
-                match value.get_value(&mut pgp_manager) {
+                match value.inner.get_value(&mut pgp_manager) {
                     | Ok(val) => {
                         env_vars.insert(key.clone(), val);
                     },
@@ -67,16 +64,68 @@ async fn main() -> Result<()> {
                 }
             }
 
-            match command {
+            // Prepare files from manifest before running command
+            let mut created_files: Vec<String> = Vec::new();
+            for (file_path, content) in profile.files.iter() {
+                let absolute_path = Path::new(file_path);
+                if absolute_path.exists() && !force {
+                    return Err(anyhow::anyhow!(
+                        "File '{}' already exists. Use --force to overwrite.",
+                        absolute_path.display()
+                    ));
+                }
+
+                let value = content.inner.get_value(&mut pgp_manager)?;
+                if let Some(parent) = absolute_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("Failed to create directories for {}", absolute_path.display()))?;
+                }
+                std::fs::write(&absolute_path, value)
+                    .with_context(|| format!("Failed to write file: {}", absolute_path.display()))?;
+                created_files.push(absolute_path.to_string_lossy().to_string());
+            }
+
+            let exec_status: Result<Option<std::process::ExitStatus>> = match command {
                 | Some(cmd_args) if !cmd_args.is_empty() => {
-                    execute_command_with_env(&cmd_args, &env_vars, &profile.env.keep)
+                    let status = execute_command_with_env(&cmd_args, &env_vars, &profile.env.keep)?;
+                    Ok(Some(status))
                 },
                 | _ => {
                     for (key, value) in env_vars {
                         println!("{}={}", key, value);
                     }
+                    Ok(None)
+                },
+            };
+
+            // Cleanup files after command execution or printing envs
+            let mut cleanup_error: Option<anyhow::Error> = None;
+            for file in created_files.iter() {
+                if let Err(e) = std::fs::remove_file(file) {
+                    cleanup_error = Some(anyhow::anyhow!(
+                        "Failed to remove file '{}': {}",
+                        file,
+                        e
+                    ));
+                }
+            }
+
+            if let Some(err) = cleanup_error {
+                eprintln!("{}", err);
+            }
+
+            match exec_status? {
+                | Some(status) => {
+                    if !status.success() {
+                        if let Some(code) = status.code() {
+                            std::process::exit(code);
+                        } else {
+                            std::process::exit(1);
+                        }
+                    }
                     Ok(())
                 },
+                | None => Ok(()),
             }
         },
         | args::Command::Init { path, force } => {
@@ -144,7 +193,7 @@ fn execute_command_with_env(
     cmd_args: &[String],
     env_vars: &HashMap<String, String>,
     keep_env_vars: &Option<Vec<String>>,
-) -> Result<()> {
+) -> Result<std::process::ExitStatus> {
     if cmd_args.is_empty() {
         return Err(anyhow::anyhow!("No command provided"));
     }
@@ -187,13 +236,5 @@ fn execute_command_with_env(
         .status()
         .with_context(|| format!("Failed to execute command: {}", program))?;
 
-    if !status.success() {
-        if let Some(code) = status.code() {
-            std::process::exit(code);
-        } else {
-            std::process::exit(1);
-        }
-    }
-
-    Ok(())
+    Ok(status)
 }
