@@ -6,12 +6,10 @@ mod pgp;
 mod reference;
 
 use {
-    anyhow::{
+    crate::manifest::{FromLocation, FromLocationWrapper}, anyhow::{
         Context,
         Result,
-    },
-    args::ManualFormat,
-    manifest::{
+    }, args::ManualFormat, manifest::{
         Content,
         ContentWrapper,
         EncodedValue,
@@ -23,13 +21,11 @@ use {
         SecretAllocation,
         SecretAllocationWrapper,
         SecretWrapper,
-    },
-    regex::Regex,
-    std::{
+    }, regex::Regex, std::{
         collections::HashMap,
         path::Path,
         process::Command,
-    },
+    }
 };
 
 #[tokio::main]
@@ -70,6 +66,27 @@ async fn main() -> Result<()> {
                 .get(profile_name.as_str())
                 .with_context(|| format!("Profile '{}' not found in manifest", profile_name))?;
 
+            for from_location in profile.env.from.iter() {
+                match &from_location.inner {
+                    | FromLocation::GCS { secret, version } => {
+                        let gcp = crate::gcp::GcpSecretManager::new().context("Failed to initialize GCP Secret Manager client")?;
+                        let spec = crate::gcp::GcpSecretSpec {
+                            secret: secret.to_string(),
+                            version: version.as_ref().map(|v| v.to_string()),
+                        };
+                        let value = gcp.access_secret(&spec)?;
+                        parse_env_lines(&value, |key, val| {
+                            env_vars.insert(key.to_string(), val.to_string());
+                        });
+                    },
+                    | FromLocation::File(file_path) => {
+                        let value = std::fs::read_to_string(file_path)?;
+                        parse_env_lines(&value, |key, val| {
+                            env_vars.insert(key.to_string(), val.to_string());
+                        });
+                    },
+                }
+            }
             for (key, value) in profile.env.vars.iter() {
                 match value.inner.get_value(&mut pgp_manager) {
                     | Ok(val) => {
@@ -225,6 +242,14 @@ async fn main() -> Result<()> {
                 env: ManifestEnv {
                     keep: Some(vec!["^PATH$".to_string(), "^LC_.*".to_string()]),
                     vars,
+                    from: vec![
+                        FromLocationWrapper {
+                            inner: FromLocation::GCS {
+                                secret: "projects/myproject/secrets/my-gcs-secret".to_string(),
+                                version: Some("latest".to_string()),
+                            },
+                        },
+                    ],
                 },
             };
 
@@ -246,6 +271,21 @@ async fn main() -> Result<()> {
             println!("Note: Remove '_EXAMPLE' suffix from variable names before using them.");
             Ok(())
         },
+    }
+}
+
+fn parse_env_lines<F>(value: &str, mut callback: F)
+where
+    F: FnMut(&str, &str),
+{
+    for line in value.lines() {
+        if let Some(pos) = line.find('=') {
+            let key = line[..pos].trim();
+            let val = line[pos + 1..].trim();
+            if !key.is_empty() {
+                callback(key, val);
+            }
+        }
     }
 }
 

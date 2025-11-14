@@ -84,6 +84,21 @@ pub struct ManifestProfile {
     pub env: ManifestEnv,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FromLocation {
+    File(String),
+    #[serde(rename = "gcs")]
+    GCS { secret: String, version: Option<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FromLocationWrapper {
+    #[serde(flatten)]
+    pub inner: FromLocation,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct ManifestEnv {
@@ -92,6 +107,9 @@ pub struct ManifestEnv {
 
     #[serde(default)]
     pub vars: HashMap<String, ContentWrapper>,
+
+    #[serde(default)]
+    pub from: Vec<FromLocationWrapper>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
