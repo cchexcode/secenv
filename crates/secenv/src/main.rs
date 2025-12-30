@@ -1,4 +1,5 @@
 mod args;
+mod aws;
 mod gcp;
 mod gpg;
 mod manifest;
@@ -75,6 +76,18 @@ async fn main() -> Result<()> {
                             version: version.as_ref().map(|v| v.to_string()),
                         };
                         let value = gcp.access_secret(&spec)?;
+                        parse_env_lines(&value, |key, val| {
+                            env_vars.insert(key.to_string(), val.to_string());
+                        });
+                    },
+                    | FromLocation::AWS { secret, version, region } => {
+                        let aws = crate::aws::AwsSecretManager::new().context("Failed to initialize AWS Secret Manager client")?;
+                        let spec = crate::aws::AwsSecretSpec {
+                            secret: secret.to_string(),
+                            version: version.as_ref().map(|v| v.to_string()),
+                            region: region.as_ref().map(|r| r.to_string()),
+                        };
+                        let value = aws.access_secret(&spec)?;
                         parse_env_lines(&value, |key, val| {
                             env_vars.insert(key.to_string(), val.to_string());
                         });

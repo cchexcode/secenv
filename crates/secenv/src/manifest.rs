@@ -1,5 +1,9 @@
 use {
     crate::{
+        aws::{
+            AwsSecretManager,
+            AwsSecretSpec,
+        },
         gcp::{
             GcpSecretManager,
             GcpSecretSpec,
@@ -43,6 +47,7 @@ pub enum SecretAllocation {
     File(String),
     Gpg { fingerprint: String },
     Gcp { secret: String, version: Option<String> },
+    Aws { secret: String, version: Option<String>, region: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +95,8 @@ pub enum FromLocation {
     File(String),
     #[serde(rename = "gcs")]
     GCS { secret: String, version: Option<String> },
+    #[serde(rename = "aws")]
+    AWS { secret: String, version: Option<String>, region: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +174,15 @@ impl SecretAllocation {
                     version: version.clone(),
                 };
                 gcp.access_secret(&spec).context("Failed to access GCP secret")
+            },
+            | SecretAllocation::Aws { secret, version, region } => {
+                let aws = AwsSecretManager::new().context("Failed to initialize AWS Secret Manager client")?;
+                let spec = AwsSecretSpec {
+                    secret: secret.clone(),
+                    version: version.clone(),
+                    region: region.clone(),
+                };
+                aws.access_secret(&spec).context("Failed to access AWS secret")
             },
         }
     }
