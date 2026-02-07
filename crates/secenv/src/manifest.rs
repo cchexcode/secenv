@@ -128,6 +128,24 @@ pub enum Content {
         secret: SecretWrapper,
         value: EncodedValueWrapper,
     },
+
+    /// Load content directly from a local file
+    File(String),
+
+    /// Load content directly from GCP Secret Manager
+    #[serde(rename = "gcs")]
+    Gcs {
+        secret: String,
+        version: Option<String>,
+    },
+
+    /// Load content directly from AWS Secrets Manager
+    #[serde(rename = "aws")]
+    Aws {
+        secret: String,
+        version: Option<String>,
+        region: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +230,26 @@ impl Content {
                         }
                     },
                 }
+            },
+            | Content::File(file_path) => {
+                std::fs::read_to_string(file_path).context(format!("Failed to read file: {}", file_path))
+            },
+            | Content::Gcs { secret, version } => {
+                let gcp = GcpSecretManager::new().context("Failed to initialize GCP Secret Manager client")?;
+                let spec = GcpSecretSpec {
+                    secret: secret.clone(),
+                    version: version.clone(),
+                };
+                gcp.access_secret(&spec).context("Failed to access GCP secret")
+            },
+            | Content::Aws { secret, version, region } => {
+                let aws = AwsSecretManager::new().context("Failed to initialize AWS Secret Manager client")?;
+                let spec = AwsSecretSpec {
+                    secret: secret.clone(),
+                    version: version.clone(),
+                    region: region.clone(),
+                };
+                aws.access_secret(&spec).context("Failed to access AWS secret")
             },
         }
     }

@@ -26,6 +26,7 @@ use {
         collections::HashMap,
         path::Path,
         process::Command,
+        sync::{Arc, Mutex},
     }
 };
 
@@ -111,23 +112,45 @@ async fn main() -> Result<()> {
                     },
                 }
             }
-            let mut created_files: Vec<String> = Vec::new();
+            // Use Arc<Mutex<>> to share created_files with the Ctrl+C handler
+            let created_files: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let cleanup_files = created_files.clone();
+
+            // Set up Ctrl+C handler to clean up files on interrupt
+            let ctrlc_handler = tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    cleanup_created_files(&cleanup_files);
+                    std::process::exit(130); // Standard exit code for SIGINT
+                }
+            });
+
             for (file_path, content) in profile.files.iter() {
                 let absolute_path = Path::new(file_path);
                 if absolute_path.exists() && !force {
+                    cleanup_created_files(&created_files);
                     return Err(anyhow::anyhow!(
                         "File '{}' already exists. Use --force to overwrite.",
                         absolute_path.display()
                     ));
                 }
-                let value = content.inner.get_value(&mut pgp_manager)?;
+                let value = match content.inner.get_value(&mut pgp_manager) {
+                    | Ok(v) => v,
+                    | Err(e) => {
+                        cleanup_created_files(&created_files);
+                        return Err(e);
+                    },
+                };
                 if let Some(parent) = absolute_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("Failed to create directories for {}", absolute_path.display()))?;
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        cleanup_created_files(&created_files);
+                        return Err(anyhow::anyhow!("Failed to create directories for {}: {}", absolute_path.display(), e));
+                    }
                 }
-                std::fs::write(&absolute_path, value)
-                    .with_context(|| format!("Failed to write file: {}", absolute_path.display()))?;
-                created_files.push(absolute_path.to_string_lossy().to_string());
+                if let Err(e) = std::fs::write(&absolute_path, value) {
+                    cleanup_created_files(&created_files);
+                    return Err(anyhow::anyhow!("Failed to write file {}: {}", absolute_path.display(), e));
+                }
+                created_files.lock().unwrap().push(absolute_path.to_string_lossy().to_string());
             }
 
             let exec_status: Result<Option<std::process::ExitStatus>> = match command {
@@ -143,16 +166,11 @@ async fn main() -> Result<()> {
                 },
             };
 
-            let mut cleanup_error: Option<anyhow::Error> = None;
-            for file in created_files.iter() {
-                if let Err(e) = std::fs::remove_file(file) {
-                    cleanup_error = Some(anyhow::anyhow!("Failed to remove file '{}': {}", file, e));
-                }
-            }
+            // Cancel the Ctrl+C handler since we're doing normal cleanup
+            ctrlc_handler.abort();
 
-            if let Some(err) = cleanup_error {
-                eprintln!("{}", err);
-            }
+            // Normal cleanup
+            cleanup_created_files(&created_files);
 
             match exec_status? {
                 | Some(status) => {
@@ -247,6 +265,21 @@ async fn main() -> Result<()> {
                     value: EncodedValueWrapper {
                         inner: EncodedValue::Literal("-----BEGIN PGP MESSAGE-----...".to_string()),
                     },
+                },
+            });
+
+            files.insert("./aws-certificate.pem".to_string(), ContentWrapper {
+                inner: Content::Aws {
+                    secret: "my-app/certificates/tls-cert".to_string(),
+                    version: None,
+                    region: Some("us-east-1".to_string()),
+                },
+            });
+
+            files.insert("./gcs-certificate.pem".to_string(), ContentWrapper {
+                inner: Content::Gcs {
+                    secret: "projects/myproject/secrets/tls-cert".to_string(),
+                    version: Some("latest".to_string()),
                 },
             });
 
@@ -350,4 +383,13 @@ fn exec_command(
         .with_context(|| format!("Failed to execute command: {}", program))?;
 
     Ok(status)
+}
+
+fn cleanup_created_files(files: &Arc<Mutex<Vec<String>>>) {
+    let files = files.lock().unwrap();
+    for file in files.iter() {
+        if let Err(e) = std::fs::remove_file(file) {
+            eprintln!("Failed to remove file '{}': {}", file, e);
+        }
+    }
 }
