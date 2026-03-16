@@ -33,3 +33,4 @@ regex = { workspace = true }
 semver = { workspace = true }
 sequoia-openpgp = { workspace = true }
 once_cell = { workspace = true }
+zeroize = { workspace = true }

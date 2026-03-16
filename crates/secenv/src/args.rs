@@ -30,20 +30,6 @@ pub(crate) struct CallArgs {
     pub command: Command,
 }
 
-impl CallArgs {
-    pub(crate) fn validate(&self) -> Result<()> {
-        if self.privileges == Privilege::Experimental {
-            return Ok(());
-        }
-
-        match &self.command {
-            | _ => (),
-        }
-
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 pub(crate) enum Command {
     Manual {
@@ -196,8 +182,10 @@ impl ClapArgumentLoader {
             let config_path = Self::get_absolute_path(subc, "config")?;
             let hocon_content = std::fs::read_to_string(&config_path)
                 .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-            let cfg: Manifest = hocon::de::from_str(&hocon_content)
+            let mut cfg: Manifest = hocon::de::from_str(&hocon_content)
                 .with_context(|| format!("Failed to parse HOCON config: {}", config_path.display()))?;
+
+            cfg.source_path = config_path.clone();
 
             cfg.validate_version()
                 .with_context(|| format!("Version validation failed for config: {}", config_path.display()))?;
@@ -236,7 +224,6 @@ impl ClapArgumentLoader {
             command: cmd,
         };
 
-        callargs.validate()?;
         Ok(callargs)
     }
 }

@@ -14,6 +14,23 @@ pub struct GpgKeySpec {
     pub fingerprint: String,
 }
 
+impl GpgKeySpec {
+    /// Create a new GpgKeySpec, validating the fingerprint is well-formed hex
+    /// (40 or 64 chars).
+    pub fn new(fingerprint: String) -> Result<Self> {
+        let is_valid =
+            (fingerprint.len() == 40 || fingerprint.len() == 64) && fingerprint.chars().all(|c| c.is_ascii_hexdigit());
+
+        if !is_valid {
+            anyhow::bail!(
+                "Invalid GPG fingerprint '{}'. Expected 40 or 64 hex characters.",
+                fingerprint
+            );
+        }
+        Ok(Self { fingerprint })
+    }
+}
+
 pub struct GpgManager;
 
 impl GpgManager {
@@ -89,5 +106,13 @@ impl GpgManager {
         let decrypted_data = String::from_utf8(output.stdout).context("GPG decrypted output is not valid UTF-8")?;
 
         Ok(decrypted_data)
+    }
+
+    /// Decrypt data using a validated key spec (convenience method for callers
+    /// that already have a spec).
+    pub fn decrypt_data_with_spec(&self, _spec: &GpgKeySpec, encrypted_data: &str) -> Result<String> {
+        // GPG uses its keyring for decryption; the spec validates the fingerprint but
+        // the actual key selection is handled by gpg internally.
+        self.decrypt_data(encrypted_data)
     }
 }

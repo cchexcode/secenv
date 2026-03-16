@@ -13,10 +13,28 @@ use {
 pub struct AwsSecretSpec {
     // Secret name or ARN: arn:aws:secretsmanager:{region}:{account-id}:secret:{secret-name}
     pub secret: String,
-    // Optional version ID or version stage (defaults to AWSCURRENT)
+    // Optional version identifier
     pub version: Option<String>,
     // Optional region override
     pub region: Option<String>,
+}
+
+impl AwsSecretSpec {
+    /// Determine whether a version string is a known AWS version stage label.
+    fn is_version_stage(version: &str) -> bool {
+        matches!(version, "AWSCURRENT" | "AWSPREVIOUS" | "AWSPENDING")
+    }
+
+    /// Apply the version argument to the AWS CLI command.
+    fn apply_version_arg(&self, cmd: &mut Command) {
+        if let Some(version) = &self.version {
+            if Self::is_version_stage(version) {
+                cmd.arg("--version-stage").arg(version);
+            } else {
+                cmd.arg("--version-id").arg(version);
+            }
+        }
+    }
 }
 
 pub struct AwsSecretManager;
@@ -36,16 +54,7 @@ impl AwsSecretManager {
             .arg("--output")
             .arg("text");
 
-        if let Some(version) = &spec.version {
-            // Version can be either a version ID or a version stage
-            // Version stages are like "AWSCURRENT", "AWSPREVIOUS"
-            // Version IDs are UUIDs
-            if version.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
-                cmd.arg("--version-stage").arg(version);
-            } else {
-                cmd.arg("--version-id").arg(version);
-            }
-        }
+        spec.apply_version_arg(&mut cmd);
 
         if let Some(region) = &spec.region {
             cmd.arg("--region").arg(region);
@@ -67,4 +76,3 @@ impl AwsSecretManager {
         Ok(value.trim_end_matches(['\n', '\r']).to_string())
     }
 }
-

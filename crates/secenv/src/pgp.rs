@@ -31,6 +31,7 @@ use {
         collections::HashMap,
         io::Read,
     },
+    zeroize::Zeroize,
 };
 
 // Cache entry for PGP keys
@@ -40,12 +41,28 @@ struct CachedKey {
     password: Option<String>,
 }
 
+impl Drop for CachedKey {
+    fn drop(&mut self) {
+        if let Some(ref mut pwd) = self.password {
+            pwd.zeroize();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct UnlockedKey {
     pub cert: openpgp::Cert,
     #[allow(dead_code)]
     pub fingerprint: String,
     pub password: Option<String>,
+}
+
+impl Drop for UnlockedKey {
+    fn drop(&mut self) {
+        if let Some(ref mut pwd) = self.password {
+            pwd.zeroize();
+        }
+    }
 }
 
 pub struct PgpManager {
@@ -117,8 +134,8 @@ impl PgpManager {
 
         let policy = Self::policy();
         let helper = CachedKeyHelper {
-            cert: unlocked_key.cert,
-            password: unlocked_key.password,
+            cert: unlocked_key.cert.clone(),
+            password: unlocked_key.password.clone(),
         };
 
         let mut decryptor = DecryptorBuilder::from_bytes(encrypted_data.as_bytes())
@@ -131,13 +148,17 @@ impl PgpManager {
             .read_to_end(&mut plaintext)
             .context("Failed reading decrypted plaintext")?;
 
-        let decrypted_data = String::from_utf8(plaintext).context("Decrypted data is not valid UTF-8")?;
+        let decrypted_data = String::from_utf8(plaintext.clone()).context("Decrypted data is not valid UTF-8")?;
+
+        // Zeroize the raw bytes buffer
+        plaintext.zeroize();
+
         Ok(decrypted_data)
     }
 
-    /// Clear the PGP key cache (useful for security or testing)
-    #[allow(dead_code)]
+    /// Clear the PGP key cache, zeroizing cached passwords
     pub fn clear_cache(&mut self) {
+        // Dropping CachedKey entries triggers zeroize via the Drop impl
         self.cache.clear();
     }
 
@@ -148,9 +169,23 @@ impl PgpManager {
     }
 }
 
+impl Drop for PgpManager {
+    fn drop(&mut self) {
+        self.clear_cache();
+    }
+}
+
 struct CachedKeyHelper {
     cert: openpgp::Cert,
     password: Option<String>,
+}
+
+impl Drop for CachedKeyHelper {
+    fn drop(&mut self) {
+        if let Some(ref mut pwd) = self.password {
+            pwd.zeroize();
+        }
+    }
 }
 
 impl VerificationHelper for CachedKeyHelper {
@@ -158,8 +193,21 @@ impl VerificationHelper for CachedKeyHelper {
         Ok(Vec::new())
     }
 
-    fn check(&mut self, _structure: MessageStructure) -> openpgp::Result<()> {
-        Ok(())
+    fn check(&mut self, structure: MessageStructure) -> openpgp::Result<()> {
+        // Note: secenv provides confidentiality (encryption) but does not verify
+        // message signatures. If signature verification is needed, provide signing
+        // certificates via get_certs() and validate the MessageStructure here.
+        //
+        // We still check that the message was successfully decrypted by verifying
+        // the structure contains at least one encryption layer.
+        for layer in structure {
+            match layer {
+                | openpgp::parse::stream::MessageLayer::Encryption { .. } => return Ok(()),
+                | openpgp::parse::stream::MessageLayer::Compression { .. } => continue,
+                | _ => continue,
+            }
+        }
+        Err(anyhow::anyhow!("Message was not encrypted").into())
     }
 }
 
