@@ -32,5 +32,6 @@ tempfile = { workspace = true }
 regex = { workspace = true }
 semver = { workspace = true }
 sequoia-openpgp = { workspace = true }
+openssl-sys = { workspace = true }
 once_cell = { workspace = true }
 zeroize = { workspace = true }
