@@ -9,26 +9,16 @@ mod reference;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use {
-    anyhow::{
-        Context,
-        Result,
-    },
+    anyhow::{Context, Result},
     args::ManualFormat,
     manifest::Manifest,
     std::{
         collections::HashMap,
-        path::{
-            Path,
-            PathBuf,
-        },
+        path::{Path, PathBuf},
         process::Command,
         sync::{
-            atomic::{
-                AtomicBool,
-                Ordering,
-            },
-            Arc,
-            Mutex,
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
         },
     },
     zeroize::Zeroize,
@@ -87,7 +77,6 @@ async fn main() -> Result<()> {
 
             let base_dir = std::env::current_dir().context("Failed to get current directory")?;
             let file_manager = SecretFileManager::new(base_dir);
-
             file_manager.validate_paths(profile.files.keys())?;
 
             let interrupted = Arc::new(AtomicBool::new(false));
@@ -199,7 +188,9 @@ impl EnvParser {
     /// Parse KEY=VALUE lines from a string, validating keys and rejecting
     /// malformed input.
     fn parse_lines<F>(value: &str, mut callback: F) -> Result<()>
-    where F: FnMut(&str, &str) {
+    where
+        F: FnMut(&str, &str),
+    {
         for (line_num, line) in value.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -258,7 +249,7 @@ impl SecretFileManager {
     }
 
     /// Validate that all file paths are within the base directory.
-    fn validate_paths<'a>(&self, paths: impl Iterator<Item=&'a String>) -> Result<()> {
+    fn validate_paths<'a>(&self, paths: impl Iterator<Item = &'a String>) -> Result<()> {
         let canonical_base = self
             .base_dir
             .canonicalize()
