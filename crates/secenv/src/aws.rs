@@ -7,16 +7,17 @@ use {
         Command,
         Stdio,
     },
+    zeroize::Zeroize,
 };
 
 #[derive(Debug, Clone)]
-pub struct AwsSecretSpec {
+pub(crate) struct AwsSecretSpec {
     // Secret name or ARN: arn:aws:secretsmanager:{region}:{account-id}:secret:{secret-name}
-    pub secret: String,
+    pub(crate) secret: String,
     // Optional version identifier
-    pub version: Option<String>,
+    pub(crate) version: Option<String>,
     // Optional region override
-    pub region: Option<String>,
+    pub(crate) region: Option<String>,
 }
 
 impl AwsSecretSpec {
@@ -37,14 +38,10 @@ impl AwsSecretSpec {
     }
 }
 
-pub struct AwsSecretManager;
+pub(crate) struct AwsSecretManager;
 
 impl AwsSecretManager {
-    pub fn new() -> Result<Self> {
-        Ok(Self)
-    }
-
-    pub fn access_secret(&self, spec: &AwsSecretSpec) -> Result<String> {
+    pub(crate) fn access_secret(&self, spec: &AwsSecretSpec) -> Result<String> {
         let mut cmd = Command::new("aws");
         cmd.args(["secretsmanager", "get-secret-value"])
             .arg("--secret-id")
@@ -52,7 +49,7 @@ impl AwsSecretManager {
             .arg("--query")
             .arg("SecretString")
             .arg("--output")
-            .arg("text");
+            .arg("json");
 
         spec.apply_version_arg(&mut cmd);
 
@@ -60,7 +57,7 @@ impl AwsSecretManager {
             cmd.arg("--region").arg(region);
         }
 
-        let output = cmd
+        let mut output = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -69,10 +66,15 @@ impl AwsSecretManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("aws CLI failed: {}", stderr));
+            let error = anyhow::anyhow!("aws CLI failed: {}", stderr);
+            output.stdout.zeroize();
+            return Err(error);
         }
 
-        let value = String::from_utf8(output.stdout).context("Secret value is not valid UTF-8")?;
-        Ok(value.trim_end_matches(['\n', '\r']).to_string())
+        let value = serde_json::from_slice::<Option<String>>(&output.stdout);
+        output.stdout.zeroize();
+        value
+            .context("AWS SecretString output is not valid JSON")?
+            .context("AWS secret does not contain SecretString")
     }
 }

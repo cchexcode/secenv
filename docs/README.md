@@ -8,6 +8,7 @@ Secure, profile-based environment variable management with HOCON configuration, 
 - ☁️ **GCP Secret Manager**: Fetch the PGP private key at runtime via `gcloud`
 - 🗂️ **Profiles**: Organize variables by profile (dev, staging, prod, …)
 - 📄 **Temporary files**: Create temporary files with plain or encrypted content that are automatically cleaned up after command execution
+- **Sealed HOCON/JSON**: Decrypt marked scalar values in place or render them from templates for the command lifetime
 - 🧪 **Docs & tooling**: Built-in manual and shell completion generators
 - ⚡ **Fast & safe**: Rust-based CLI
 
@@ -31,6 +32,26 @@ The binary will be at `target/release/secenv`.
 version = "0.0.0"  # Must be semver and compatible with the CLI version
 
 profiles.default {
+  # Optional: decrypt marked values in HOCON/JSON files while the command runs.
+  # Every file has its own PGP key or Argon2id passphrase from a remote source.
+  sealed {
+    # Replace these files in place, then restore their exact encrypted bytes.
+    files {
+      "./application.conf" {
+        secret.pgp.gcp.secret = "projects/123456789/secrets/application-pgp-key"
+      }
+    }
+
+    # Or render a temporary output from an encrypted template.
+    # Map keys are output paths; source is the encrypted template path.
+    templates {
+      "./runtime-config.json" {
+        source = "./runtime-config.json.sealed"
+        secret.argon2id_xchacha20_poly1305.gcp.secret = "projects/123456789/secrets/runtime-passphrase"
+      }
+    }
+  }
+
   # Optional: Define temporary files that will be created before command execution
   # and automatically cleaned up afterwards
   files {
@@ -94,7 +115,7 @@ secenv unlock
 # Use a specific profile and config path
 secenv unlock --config /path/to/secenv.conf --profile production
 
-# Load into current shell (bash/zsh/fish)
+# Load into a POSIX shell (bash/zsh)
 eval "$(secenv unlock --profile production)"
 ```
 
@@ -110,6 +131,9 @@ secenv unlock --profile production -- printenv | sort
 # Execute a command (temporary files defined in the profile will be created and cleaned up)
 secenv unlock --profile production -- make deploy
 
+# Stop a long-running command after five minutes, then clean up plaintext files
+secenv unlock --profile production --timeout 300 -- make deploy
+
 # Overwrite existing files if they already exist
 secenv unlock --profile production --force -- make deploy
 ```
@@ -120,7 +144,7 @@ APP_NAME=myapp
 SECRET_TOKEN=...
 ```
 
-**Note**: When executing a command, any files defined in `profiles.<profile>.files` are created before the command runs and automatically deleted after the command completes. Use `--force` to overwrite existing files.
+**Note**: When executing a command, files defined in `profiles.<profile>.files` are created before the command runs and deleted afterward. With `--force`, a pre-existing file is restored instead of deleted.
 
 ## Temporary files
 
@@ -138,8 +162,8 @@ The temporary files feature allows you to create files with sensitive content th
 3. **Creation**: Before running a command (or printing env vars), all files are created with their decrypted content
 4. **Directory creation**: Parent directories are automatically created if they don't exist
 5. **Conflict handling**: If a file already exists, the operation fails unless `--force` is used
-6. **Cleanup**: After the command completes (or env vars are printed), all created files are automatically deleted
-7. **Error handling**: If cleanup fails, an error is printed to stderr, but the original command's exit code is preserved
+6. **Cleanup**: Created files are deleted; pre-existing files overwritten with `--force` are restored
+7. **Error handling**: Cleanup failures are reported as command failures and retried when the file manager is dropped
 
 ### Example use case
 
@@ -172,6 +196,133 @@ secenv unlock --profile production -- kubectl get pods
 # The kubeconfig and service account files are created, kubectl runs, then files are deleted
 ```
 
+## Sealed HOCON and JSON values
+
+Profiles can decrypt individual string values inside existing HOCON or JSON documents. Each file or template selects PGP or Argon2id/XChaCha20-Poly1305 and loads its own key material from GCP Secret Manager or AWS Secrets Manager. All required secrets are fetched and every document is decrypted and authenticated in zeroized in-memory buffers before any plaintext document is written.
+
+Encrypted values use a single-line marker containing a base64-encoded OpenPGP message:
+
+```hocon
+database {
+  host = "localhost"
+  password = "ENC[PGP,<base64-encoded OpenPGP message>]"
+}
+```
+
+Password-based values use a versioned Argon2id/XChaCha20-Poly1305 payload:
+
+```hocon
+database.password = "ENC[ARGON2ID-XCHACHA20-POLY1305,<base64-versioned-payload>]"
+```
+
+The same marker works in JSON:
+
+```json
+{
+  "database": {
+    "host": "localhost",
+    "password": "ENC[PGP,<base64-encoded OpenPGP message>]"
+  }
+}
+```
+
+Configure in-place files and templates on each profile:
+
+```hocon
+profiles.production.sealed {
+  # Decrypted atomically in place before the command and restored afterward.
+  files {
+    "./application.conf" {
+      secret.pgp.gcp.secret = "projects/myproject/secrets/application-pgp-key"
+      # secret.pgp.gcp.version = "latest"  # optional
+    }
+    "./settings.json" {
+      secret.argon2id_xchacha20_poly1305.aws.secret = "my-app/settings-passphrase"
+      # secret.argon2id_xchacha20_poly1305.aws.version = "AWSCURRENT"  # optional
+      # secret.argon2id_xchacha20_poly1305.aws.region = "us-east-1"    # optional
+    }
+  }
+
+  # Each map key is a temporary output path.
+  templates {
+    "./generated/runtime.conf" {
+      source = "./templates/runtime.conf.sealed"
+      secret.pgp.gcp.secret = "projects/myproject/secrets/runtime-pgp-key"
+    }
+    "./generated/credentials.json" {
+      source = "./templates/credentials.json.sealed"
+      secret.argon2id_xchacha20_poly1305.aws.secret = "my-app/credentials-passphrase"
+    }
+  }
+}
+```
+
+### Generating sealed values
+
+`secenv seal` selects a configured in-place path or template output path and uses that entry's configured algorithm. PGP entries encrypt with the public portion of a remote secret-backed certificate. Argon2id/XChaCha20-Poly1305 entries derive an encryption key from the remote passphrase.
+
+Pass plaintext directly and write only the sealed marker to stdout:
+
+```bash
+secenv seal \
+  --profile production \
+  --for ./application.conf \
+  'database-password'
+```
+
+Direct values can be visible in shell history and process listings. For sensitive values, pipe plaintext on stdin instead:
+
+```bash
+printf %s 'database-password' \
+  | secenv seal --profile production --for ./application.conf
+```
+
+Read a string from a HOCON/JSON document and atomically replace it with the sealed marker:
+
+```bash
+secenv seal \
+  --profile production \
+  --for ./application.conf \
+  --path /database/password
+```
+
+For templates, `--for` names the configured output path and the command updates its `source` document:
+
+```bash
+secenv seal \
+  --profile production \
+  --for ./generated/credentials.json \
+  --path /service/token
+```
+
+Path mode uses RFC 6901 JSON Pointers, including `/database/password`, `/key.with.dots`, and `/items/0`. Escape `~` as `~0` and `/` inside a key as `~1`; an empty pointer selects the document root. The selected value must exist and be a plaintext string. Path mode materializes the updated document as canonical JSON, so HOCON comments and formatting are not preserved.
+
+Path sealing rejects HOCON substitutions because they can alias the plaintext selected for encryption. For example:
+
+```hocon
+password = "plaintext"
+password_copy = ${password}
+```
+
+HOCON resolves `password_copy` to `"plaintext"` before secenv traverses the document. Sealing only `/password` would otherwise replace that node while canonical output persisted `password_copy` in plaintext. Secenv therefore rejects path sealing whenever the source contains `${`. During `unlock`, in-document substitutions are allowed: if `password` already contains an `ENC[...]` marker, the parser resolves `password_copy` to the same marker and structure-aware traversal decrypts both string nodes. System-environment substitutions such as `${HOME}` remain disabled.
+
+Behavior and constraints:
+
+- A marker must occupy the complete string value. Decrypted values are emitted as strings.
+- A marker's algorithm must match its file's configured secret type; mixed algorithms within one file are rejected.
+- `argon2id_xchacha20_poly1305` uses Argon2id with 19 MiB memory, 2 iterations, and 1 lane to derive a 256-bit key. Its versioned payload contains a random 16-byte salt, random 24-byte nonce, and authenticated XChaCha20-Poly1305 ciphertext. Use a high-entropy remote passphrase.
+- Unmarked strings and all numbers, booleans, arrays, objects, and null values are preserved.
+- Documents are parsed strictly as HOCON and materialized as canonical JSON, which is valid HOCON. System-environment substitutions such as `${HOME}` are disabled; normal substitutions within the document still resolve.
+- In-place source bytes, formatting, comments, and basic file permissions are restored after execution. Atomic replacement creates a new inode, so original ownership, hard-link identity, ACLs, extended attributes, and timestamps are not guaranteed to be preserved.
+- In-place files and template sources must already exist and must be regular files inside the current project directory. Symbolic links, hard-linked files on Unix, and paths outside the project are rejected.
+- Decrypted files use mode `0600` on Unix.
+- Template outputs are removed after execution. With `--force`, a pre-existing output is restored instead of deleted.
+- A template source may be configured for only one output because each output owns an independent key.
+- Restoration runs after successful commands, command failures, startup errors after replacement, timeout, Ctrl-C, and SIGTERM. It cannot run after SIGKILL, a power loss, or an unrecoverable process crash, so in-place mode should only be used where that residual risk is acceptable.
+- On timeout, Ctrl-C, or SIGTERM, `secenv` attempts to terminate and reap the immediate child process before restoring or removing secret files. Termination failures are reported; a successfully terminated timed-out command exits with status 124 after cleanup.
+- Do not concurrently rename configured files or their parent directories while `secenv unlock` is active.
+- Selecting a document with no valid marker is an error, as are malformed markers and failed decryptions.
+
 ## Configuration reference (JSON/HOCON)
 
 ### Top-level
@@ -180,6 +331,19 @@ secenv unlock --profile production -- kubectl get pods
 version = "<semver>"
 profiles = { 
   <name> = { 
+    sealed = {                     # optional inline HOCON/JSON decryption
+      files = {                    # optional in-place files
+        <path> = {
+          secret = { pgp|argon2id_xchacha20_poly1305 = { gcp|aws = { ... } } }
+        }
+      },
+      templates = {                # optional temporary outputs
+        <output> = {
+          source = <source>,
+          secret = { pgp|argon2id_xchacha20_poly1305 = { gcp|aws = { ... } } }
+        }
+      }
+    },
     files = { ... }              # optional
     env = { 
       keep = [<regex>],          # optional
@@ -255,12 +419,9 @@ profiles.<profile>.env.vars {                          # required
 
 Important:
 - Reading plain values from files or environment variables is not supported in the new manifest. Provide plain values inline via `literal`/`base64`.
-- Decryption via GPG keyring is supported only by specifying a `fingerprint`.
+- Decryption via GPG keyring requires a `fingerprint`, and secenv verifies that GPG used that key.
 
 ## CLI reference
-
-Global options:
-- `-e, --experimental` – enable experimental features
 
 Commands:
 
@@ -274,17 +435,36 @@ Options:
   -c, --config <path>     Path to config (default: secenv.conf)
   -p, --profile <name>    Profile name (default: default)
   -f, --force             Overwrite existing files defined in the manifest
+      --timeout <seconds> Maximum subcommand runtime; requires COMMAND
 ```
 
 Behavior:
-- Without `COMMAND`, prints `KEY=VALUE` lines to stdout. If the profile defines temporary files, they are created and immediately cleaned up.
+- Without `COMMAND`, prints POSIX `export KEY=VALUE` lines to stdout. If the profile defines temporary files, they are created and immediately cleaned up.
 - With `COMMAND`, executes it with variables set and temporary files created. Files are automatically cleaned up after the command completes.
+- With `--timeout`, attempts to terminate and reap the immediate child after the given number of seconds, cleans up plaintext files, and exits 124 when termination and cleanup succeed.
 - If `env.keep` is set in the profile, the child environment is cleared first and only host variables matching any regex in `keep` are preserved; otherwise, the full host environment is kept.
 - Temporary files defined in `profiles.<profile>.files` are created before command execution:
   - Parent directories are automatically created if they don't exist
   - If a file already exists, the command fails unless `--force` is specified
   - Files support both plain and secure (PGP-encrypted) content
-  - All created files are automatically removed after command execution or when printing environment variables
+  - Created files are removed; pre-existing files overwritten with `--force` are restored
+- Sealed in-place files and template outputs exist in decrypted form only while `unlock` is active and are restored or removed before it exits.
+
+### seal
+Encrypt a value using the remote PGP key or Argon2id passphrase configured for one sealed file.
+
+```bash
+secenv seal --for <configured-path> [VALUE] [OPTIONS]
+secenv seal --for <configured-path> --path <json-pointer> [OPTIONS]
+
+Options:
+  -c, --config <path>     Path to config (default: secenv.conf)
+  -p, --profile <name>    Profile name (default: default)
+      --for <path>        Configured in-place path or template output path
+      --path <json-pointer> RFC 6901 pointer to one string in the configured source document
+```
+
+Without `--path`, plaintext comes from positional `VALUE`, or exactly from piped stdin when `VALUE` is omitted, and the marker is written to stdout. Direct values may be exposed through shell history and process listings. With `--path`, `VALUE` is rejected, the selected source document is updated, and the resulting marker is also written to stdout.
 
 ### man
 Render the manual pages or markdown help.
@@ -322,16 +502,11 @@ Notes:
 
 - "Profile '<name>' not found": Verify `profiles.<name>` exists in the config.
 - "Failed to parse HOCON config": Validate HOCON syntax and file path.
-- "File '<path>' already exists": A temporary file defined in the profile conflicts with an existing file. Use `--force` to overwrite or remove the existing file.
+- "File '<path>' already exists": A temporary file conflicts with an existing file. Use `--force` to replace it temporarily and restore it afterward.
 - GCP access errors: Check `gcloud` authentication, project, permissions, and secret name.
 - PGP decryption errors: Ensure the private key is valid ASCII‑armored and corresponds to the message.
-- File cleanup errors: If temporary file cleanup fails after command execution, an error message will be printed to stderr, but the command exit code will still be preserved.
-
-For verbose logs:
-
-```bash
-RUST_LOG=debug secenv unlock
-```
+- Sealed document errors: Ensure each selected file is valid HOCON/JSON and each encrypted string uses `ENC[PGP,<base64>]` or `ENC[ARGON2ID-XCHACHA20-POLY1305,<base64>]` matching the file configuration.
+- File cleanup errors: Cleanup failures are reported as command failures and retried when the file manager is dropped.
 
 ## Testing
 

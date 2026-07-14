@@ -24,32 +24,28 @@ tokio = { version = "1.47.1", features = [
     "sync",
     "signal",
 ] }
-async-trait = "0.1.89"
 clap = "4.5.46"
 clap_complete = "4.5.57"
 clap_mangen = "0.2.29"
 clap-markdown = "0.1.5"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.145"
-hocon = "0.9"
-anyhow = "1.0.99"
+hocon = { version = "0.9", default-features = false, features = ["serde-support"] }
+anyhow = "1.0.103"
 path-clean = "1.0.1"
-dirs = "6.0"
 rpassword = "7.4"
 base64 = "0.22"
 tempfile = "3.21"
 regex = "1.11"
 semver = "1.0"
-sequoia-openpgp = { version = "2.0.0", default-features = false, features = [
+sequoia-openpgp = { version = "=2.1.0", default-features = false, features = [
     "compression",
     "crypto-openssl",
 ] }
 # Feature-unifies with Sequoia's OpenSSL backend so installs build the crypto
 # provider from vendored source instead of requiring system nettle/OpenSSL.
 openssl-sys = { version = "0.9", features = ["vendored"] }
-once_cell = "1.19"
-zeroize = { version = "1.8", features = ["derive"] }
-# proc macro
-proc-macro2 = "1.0"
-quote = "1.0"
-syn = { version = "2.0", features = ["full", "extra-traits"] }
+zeroize = "1.8"
+argon2 = { version = "0.5", features = ["zeroize"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+rand = { version = "0.8", default-features = false, features = ["getrandom"] }

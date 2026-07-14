@@ -21,6 +21,11 @@ use {
             Policy,
             StandardPolicy,
         },
+        serialize::stream::{
+            Encryptor,
+            LiteralWriter,
+            Message,
+        },
         types::SymmetricAlgorithm,
         KeyHandle,
     },
@@ -29,73 +34,39 @@ use {
     },
     std::{
         collections::HashMap,
-        io::Read,
+        io::{
+            Read,
+            Write,
+        },
     },
-    zeroize::Zeroize,
+    zeroize::{
+        Zeroize,
+        Zeroizing,
+    },
 };
 
-// Cache entry for PGP keys
 #[derive(Clone)]
-struct CachedKey {
+struct KeyCredentials {
     cert: openpgp::Cert,
-    password: Option<String>,
+    password: Option<Zeroizing<String>>,
 }
 
-impl Drop for CachedKey {
-    fn drop(&mut self) {
-        if let Some(ref mut pwd) = self.password {
-            pwd.zeroize();
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct UnlockedKey {
-    pub cert: openpgp::Cert,
-    #[allow(dead_code)]
-    pub fingerprint: String,
-    pub password: Option<String>,
-}
-
-impl Drop for UnlockedKey {
-    fn drop(&mut self) {
-        if let Some(ref mut pwd) = self.password {
-            pwd.zeroize();
-        }
-    }
-}
-
-pub struct PgpManager {
-    cache: HashMap<String, CachedKey>,
+#[derive(Default)]
+pub(crate) struct PgpManager {
+    cache: HashMap<String, KeyCredentials>,
 }
 
 impl PgpManager {
-    pub fn new() -> Result<Self> {
-        Ok(Self { cache: HashMap::new() })
-    }
-
     fn policy() -> Box<dyn Policy+Send+Sync> {
         Box::new(StandardPolicy::new())
     }
 
-    /// Extract the primary key fingerprint from a certificate
-    fn get_fingerprint(cert: &openpgp::Cert) -> Result<String> {
-        let fingerprint = cert.fingerprint().to_hex();
-        Ok(fingerprint)
-    }
-
-    /// Unlock a PGP private key with password prompting if needed
-    fn unlock_key(&mut self, private_key_asc: &str) -> Result<UnlockedKey> {
+    fn key_credentials(&self, private_key_asc: &str) -> Result<(String, KeyCredentials)> {
         let cert = openpgp::Cert::from_bytes(private_key_asc.as_bytes()).context("Failed to parse PGP private key")?;
-
-        let fingerprint = Self::get_fingerprint(&cert)?;
+        let fingerprint = cert.fingerprint().to_hex();
 
         if let Some(cached_key) = self.cache.get(&fingerprint) {
-            return Ok(UnlockedKey {
-                cert: cached_key.cert.clone(),
-                fingerprint,
-                password: cached_key.password.clone(),
-            });
+            return Ok((fingerprint, cached_key.clone()));
         }
 
         let policy = Self::policy();
@@ -112,60 +83,95 @@ impl PgpManager {
         let password = if needs_password {
             let pwd = rpassword::prompt_password(format!("Enter password for PGP key {}: ", &fingerprint[..16]))
                 .context("Failed to read password")?;
-            Some(pwd)
+            Some(Zeroizing::new(pwd))
         } else {
             None
         };
 
-        self.cache.insert(fingerprint.clone(), CachedKey {
-            cert: unlocked_cert.clone(),
-            password: password.clone(),
-        });
-
-        Ok(UnlockedKey {
+        Ok((fingerprint, KeyCredentials {
             cert: unlocked_cert,
-            fingerprint,
             password,
-        })
+        }))
     }
 
-    pub fn decrypt(&mut self, private_key_asc: &str, encrypted_data: &str) -> Result<String> {
-        let unlocked_key = self.unlock_key(private_key_asc)?;
+    pub(crate) fn decrypt(&mut self, private_key_asc: &str, encrypted_data: &str) -> Result<String> {
+        self.decrypt_bytes(private_key_asc, encrypted_data.as_bytes())
+    }
+
+    pub(crate) fn encrypt(&self, certificate: &str, plaintext: &str) -> Result<Vec<u8>> {
+        let cert = openpgp::Cert::from_bytes(certificate.as_bytes()).context("Failed to parse PGP certificate")?;
+        let policy = Self::policy();
+        let mut recipients: Vec<_> = cert
+            .keys()
+            .with_policy(&*policy, None)
+            .supported()
+            .alive()
+            .revoked(false)
+            .for_storage_encryption()
+            .collect();
+        if recipients.is_empty() {
+            recipients = cert
+                .keys()
+                .with_policy(&*policy, None)
+                .supported()
+                .alive()
+                .revoked(false)
+                .for_transport_encryption()
+                .collect();
+        }
+        if recipients.is_empty() {
+            anyhow::bail!("PGP certificate has no supported, active encryption key");
+        }
+        let mut ciphertext = Vec::new();
+        let message = Message::new(&mut ciphertext);
+        let message = Encryptor::for_recipients(message, recipients)
+            .build()
+            .context("Failed to initialize PGP encryptor")?;
+        let mut message = LiteralWriter::new(message)
+            .build()
+            .context("Failed to initialize PGP literal writer")?;
+        message
+            .write_all(plaintext.as_bytes())
+            .context("Failed to encrypt plaintext")?;
+        message.finalize().context("Failed to finalize PGP message")?;
+        Ok(ciphertext)
+    }
+
+    pub(crate) fn decrypt_bytes(&mut self, private_key_asc: &str, encrypted_data: &[u8]) -> Result<String> {
+        let (fingerprint, credentials) = self.key_credentials(private_key_asc)?;
 
         let policy = Self::policy();
-        let helper = CachedKeyHelper {
-            cert: unlocked_key.cert.clone(),
-            password: unlocked_key.password.clone(),
+        let helper = KeyCredentialsHelper {
+            cert: credentials.cert.clone(),
+            password: credentials.password.clone(),
         };
 
-        let mut decryptor = DecryptorBuilder::from_bytes(encrypted_data.as_bytes())
+        let mut decryptor = DecryptorBuilder::from_bytes(encrypted_data)
             .context("Failed to parse encrypted PGP message")?
             .with_policy(&*policy, None, helper)
             .context("Failed to initialize PGP decryptor")?;
 
         let mut plaintext = Vec::new();
-        decryptor
-            .read_to_end(&mut plaintext)
-            .context("Failed reading decrypted plaintext")?;
+        if let Err(error) = decryptor.read_to_end(&mut plaintext) {
+            plaintext.zeroize();
+            return Err(error).context("Failed reading decrypted plaintext");
+        }
 
-        let decrypted_data = String::from_utf8(plaintext.clone()).context("Decrypted data is not valid UTF-8")?;
-
-        // Zeroize the raw bytes buffer
-        plaintext.zeroize();
-
-        Ok(decrypted_data)
+        let plaintext = match String::from_utf8(plaintext) {
+            | Ok(decrypted_data) => decrypted_data,
+            | Err(error) => {
+                let mut plaintext = error.into_bytes();
+                plaintext.zeroize();
+                anyhow::bail!("Decrypted data is not valid UTF-8");
+            },
+        };
+        self.cache.insert(fingerprint, credentials);
+        Ok(plaintext)
     }
 
     /// Clear the PGP key cache, zeroizing cached passwords
-    pub fn clear_cache(&mut self) {
-        // Dropping CachedKey entries triggers zeroize via the Drop impl
+    pub(crate) fn clear_cache(&mut self) {
         self.cache.clear();
-    }
-
-    /// Get cache statistics for debugging
-    #[allow(dead_code)]
-    pub fn cache_stats(&self) -> usize {
-        self.cache.len()
     }
 }
 
@@ -175,20 +181,12 @@ impl Drop for PgpManager {
     }
 }
 
-struct CachedKeyHelper {
+struct KeyCredentialsHelper {
     cert: openpgp::Cert,
-    password: Option<String>,
+    password: Option<Zeroizing<String>>,
 }
 
-impl Drop for CachedKeyHelper {
-    fn drop(&mut self) {
-        if let Some(ref mut pwd) = self.password {
-            pwd.zeroize();
-        }
-    }
-}
-
-impl VerificationHelper for CachedKeyHelper {
+impl VerificationHelper for KeyCredentialsHelper {
     fn get_certs(&mut self, _ids: &[KeyHandle]) -> openpgp::Result<Vec<openpgp::Cert>> {
         Ok(Vec::new())
     }
@@ -207,11 +205,11 @@ impl VerificationHelper for CachedKeyHelper {
                 | _ => continue,
             }
         }
-        Err(anyhow::anyhow!("Message was not encrypted").into())
+        Err(anyhow::anyhow!("Message was not encrypted"))
     }
 }
 
-impl DecryptionHelper for CachedKeyHelper {
+impl DecryptionHelper for KeyCredentialsHelper {
     fn decrypt(
         &mut self,
         pkesks: &[PKESK],
@@ -260,5 +258,31 @@ impl DecryptionHelper for CachedKeyHelper {
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        openpgp::{
+            cert::prelude::CertBuilder,
+            serialize::SerializeInto,
+        },
+    };
+
+    #[test]
+    fn encrypts_with_public_certificate_and_decrypts_with_private_key() -> Result<()> {
+        let (cert, _) = CertBuilder::new()
+            .add_userid("secenv test")
+            .add_storage_encryption_subkey()
+            .generate()?;
+        let public_cert = String::from_utf8(cert.armored().to_vec()?)?;
+        let private_key = String::from_utf8(cert.as_tsk().armored().to_vec()?)?;
+        let mut manager = PgpManager::default();
+
+        let ciphertext = manager.encrypt(&public_cert, "sealed value")?;
+        assert_eq!(manager.decrypt_bytes(&private_key, &ciphertext)?, "sealed value");
+        Ok(())
     }
 }

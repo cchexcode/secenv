@@ -3,147 +3,238 @@ mod aws;
 mod gcp;
 mod gpg;
 mod manifest;
+mod password_cipher;
 mod pgp;
 mod reference;
+mod sealed;
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use {
-    anyhow::{Context, Result},
-    args::ManualFormat,
+    anyhow::{
+        Context,
+        Result,
+    },
+    args::{
+        ManualFormat,
+        UnlockAction,
+    },
     manifest::Manifest,
     std::{
         collections::HashMap,
-        path::{Path, PathBuf},
-        process::Command,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc, Mutex,
-        },
+        io::Write,
+        process::ExitCode,
     },
-    zeroize::Zeroize,
+    zeroize::{
+        Zeroize,
+        Zeroizing,
+    },
 };
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cmd = crate::args::ClapArgumentLoader::load()?;
+async fn main() -> Result<ExitCode> {
+    let command = crate::args::ClapArgumentLoader::load()?;
 
-    match cmd.command {
+    match command {
         | crate::args::Command::Manual { path, format } => {
             std::fs::create_dir_all(&path)
                 .with_context(|| format!("Failed to create directory: {}", path.display()))?;
-            let builder = crate::reference::ReferenceBuilder::new();
+            let builder = crate::reference::ReferenceBuilder;
             match format {
                 | ManualFormat::Manpages => builder.build_manpages(&path)?,
                 | ManualFormat::Markdown => builder.build_markdown(&path)?,
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         },
         | crate::args::Command::Autocomplete { path, shell } => {
             std::fs::create_dir_all(&path)
                 .with_context(|| format!("Failed to create directory: {}", path.display()))?;
-            let builder = crate::reference::ReferenceBuilder::new();
+            let builder = crate::reference::ReferenceBuilder;
             builder.build_shell_completion(&path, &shell)?;
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         },
         | crate::args::Command::Unlock {
             manifest,
             profile_name,
-            command,
+            action,
             force,
+            timeout,
         } => {
             manifest.warn_if_insecure_permissions();
 
-            let mut pgp_manager = crate::pgp::PgpManager::new().context("Failed to initialize PGP manager")?;
+            let mut pgp_manager = crate::pgp::PgpManager::default();
 
             let profile = manifest
                 .profiles
                 .get(profile_name.as_str())
                 .with_context(|| format!("Profile '{}' not found in manifest", profile_name))?;
 
-            let mut env_vars = EnvParser::load_from_profile(profile)?;
+            let generated_files: Vec<_> = profile.files.keys().cloned().collect();
+            let sealed_file_manager = crate::sealed::SealedFileManager::new(
+                std::env::current_dir().context("Failed to get current directory")?,
+            )?;
+            sealed_file_manager.validate_profile(profile.sealed.as_ref(), &generated_files, force)?;
+
+            let mut environment = Environment::load(profile)?;
 
             for (key, value) in profile.env.vars.iter() {
-                match value.inner.get_value(&mut pgp_manager) {
-                    | Ok(val) => {
-                        env_vars.insert(key.clone(), val);
-                    },
-                    | Err(e) => {
-                        eprintln!("Error getting value for {}: {}", key, e);
-                        return Err(e);
-                    },
-                }
+                let value = value
+                    .inner
+                    .resolve(&mut pgp_manager)
+                    .with_context(|| format!("Failed to resolve environment variable '{}'", key))?;
+                environment.insert(key.clone(), value)?;
             }
 
-            let base_dir = std::env::current_dir().context("Failed to get current directory")?;
-            let file_manager = SecretFileManager::new(base_dir);
-            file_manager.validate_paths(profile.files.keys())?;
-
-            let interrupted = Arc::new(AtomicBool::new(false));
-            let interrupted_clone = interrupted.clone();
-            let cleanup_handle = file_manager.created_files.clone();
-
-            let ctrlc_handler = tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    interrupted_clone.store(true, Ordering::SeqCst);
-                    SecretFileManager::cleanup(&cleanup_handle);
-                    std::process::exit(130);
-                }
-            });
-
+            // Resolve remote and interactive sources before materializing any
+            // plaintext files. Signals retain their default behavior here.
+            let mut generated_content = Vec::with_capacity(profile.files.len());
             for (file_path, content) in profile.files.iter() {
-                let value = match content.inner.get_value(&mut pgp_manager) {
-                    | Ok(v) => v,
-                    | Err(e) => {
-                        file_manager.cleanup_all();
-                        return Err(e);
-                    },
-                };
-                if let Err(e) = file_manager.write(file_path, &value, force) {
-                    file_manager.cleanup_all();
-                    return Err(e);
-                }
+                generated_content.push((
+                    file_path.clone(),
+                    Zeroizing::new(
+                        content
+                            .inner
+                            .resolve(&mut pgp_manager)
+                            .with_context(|| format!("Failed to resolve temporary file '{}'", file_path))?,
+                    ),
+                ));
             }
 
-            let exec_status: Result<Option<std::process::ExitStatus>> = match command {
-                | Some(cmd_args) if !cmd_args.is_empty() => {
-                    let executor = CommandExecutor::new(&cmd_args, &env_vars, &profile.env.keep);
-                    let status = executor.run()?;
-                    Ok(Some(status))
-                },
-                | _ => {
-                    for (key, value) in &env_vars {
-                        println!(
-                            "export {}={}",
-                            EnvParser::shell_escape(key),
-                            EnvParser::shell_escape(value)
-                        );
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let shutdown_handle = tokio::spawn(async move {
+                let exit_code = shutdown_signal(ready_tx).await;
+                let _ = shutdown_tx.send(exit_code).await;
+            });
+            ready_rx.await.context("Failed to initialize signal handling")??;
+
+            let mut interrupted = None;
+            let setup_result: Result<()> = {
+                let mut poll_shutdown = || {
+                    if interrupted.is_some() {
+                        return true;
                     }
-                    Ok(None)
-                },
-            };
+                    if let Ok(exit_code) = shutdown_rx.try_recv() {
+                        interrupted = Some(exit_code);
+                        return true;
+                    }
+                    false
+                };
 
-            ctrlc_handler.abort();
-            file_manager.cleanup_all();
+                (|| {
+                    if let Some(sealed) = &profile.sealed {
+                        sealed_file_manager.unseal(
+                            sealed,
+                            &generated_files,
+                            &mut pgp_manager,
+                            force,
+                            &mut poll_shutdown,
+                        )?;
+                    }
 
-            for (_, val) in env_vars.iter_mut() {
-                val.zeroize();
-            }
-            pgp_manager.clear_cache();
-
-            match exec_status? {
-                | Some(status) => {
-                    if !status.success() {
-                        if let Some(code) = status.code() {
-                            std::process::exit(code);
-                        } else {
-                            std::process::exit(1);
+                    for (file_path, value) in generated_content.iter_mut() {
+                        if poll_shutdown() {
+                            anyhow::bail!("Interrupted before plaintext files were written");
                         }
+                        sealed_file_manager.write_generated(file_path, value.as_str(), force)?;
+                        value.zeroize();
                     }
                     Ok(())
-                },
-                | None => Ok(()),
+                })()
+            };
+
+            let execution_result: Result<ExecutionOutcome> = async {
+                if let Some(exit_code) = interrupted {
+                    return Ok(ExecutionOutcome::Interrupted(exit_code));
+                }
+                setup_result?;
+                if let Ok(exit_code) = shutdown_rx.try_recv() {
+                    return Ok(ExecutionOutcome::Interrupted(exit_code));
+                }
+                match action {
+                    | UnlockAction::Run(command) => {
+                        let executor = CommandExecutor::new(&command, &environment, &profile.env.keep);
+                        executor.execute(timeout, &mut shutdown_rx).await
+                    },
+                    | UnlockAction::Print => {
+                        let stdout = std::io::stdout();
+                        let mut stdout = stdout.lock();
+                        for (key, value) in environment.iter() {
+                            if let Ok(exit_code) = shutdown_rx.try_recv() {
+                                return Ok(ExecutionOutcome::Interrupted(exit_code));
+                            }
+                            writeln!(
+                                stdout,
+                                "export {}={}",
+                                Environment::shell_escape(key),
+                                Environment::shell_escape(value)
+                            )
+                            .context("Failed to write environment exports")?;
+                        }
+                        Ok(ExecutionOutcome::Printed)
+                    },
+                }
             }
+            .await;
+
+            let restore_result = sealed_file_manager.restore_all();
+            pgp_manager.clear_cache();
+
+            shutdown_handle.abort();
+            let _ = shutdown_handle.await;
+            let late_interrupt = shutdown_rx.try_recv().ok();
+
+            restore_result?;
+            let outcome = execution_result?;
+            let outcome = match late_interrupt {
+                | Some(exit_code) => ExecutionOutcome::Interrupted(exit_code),
+                | None => outcome,
+            };
+            Ok(outcome.exit_code())
+        },
+        | crate::args::Command::Seal {
+            manifest,
+            profile_name,
+            configured_file,
+            input,
+        } => {
+            manifest.warn_if_insecure_permissions();
+            let profile = manifest
+                .profiles
+                .get(&profile_name)
+                .with_context(|| format!("Profile '{}' not found in manifest", profile_name))?;
+            let sealed = profile
+                .sealed
+                .as_ref()
+                .with_context(|| format!("Profile '{}' has no sealed files", profile_name))?;
+            let manager = crate::sealed::SealedFileManager::new(
+                std::env::current_dir().context("Failed to get current directory")?,
+            )?;
+            let pgp_manager = crate::pgp::PgpManager::default();
+
+            let marker = match input {
+                | crate::args::SealInput::Pointer(pointer) => {
+                    manager.seal_path(sealed, &configured_file, &pointer, &pgp_manager)?
+                },
+                | crate::args::SealInput::Direct(plaintext) => {
+                    manager.seal_value(sealed, &configured_file, plaintext.as_str(), &pgp_manager)?
+                },
+                | crate::args::SealInput::Stdin => {
+                    use std::io::{
+                        IsTerminal,
+                        Read,
+                    };
+
+                    if std::io::stdin().is_terminal() {
+                        anyhow::bail!("No VALUE provided; pass it directly or pipe plaintext on stdin");
+                    }
+                    let mut plaintext = Zeroizing::new(String::new());
+                    std::io::stdin()
+                        .read_to_string(&mut plaintext)
+                        .context("Failed to read plaintext from stdin")?;
+                    manager.seal_value(sealed, &configured_file, plaintext.as_str(), &pgp_manager)?
+                },
+            };
+            writeln!(std::io::stdout().lock(), "{}", marker).context("Failed to write sealed marker")?;
+            Ok(ExitCode::SUCCESS)
         },
         | args::Command::Init { path, force } => {
             if path.exists() && !force {
@@ -161,248 +252,228 @@ async fn main() -> Result<()> {
             std::fs::write(&path, json_config)
                 .with_context(|| format!("Failed to write config file: {}", path.display()))?;
 
-            println!("Created example configuration file: {}", path.display());
-            println!("Edit the file to add your own variables and PGP keys.");
-            println!("Note: Remove '_EXAMPLE' suffix from variable names before using them.");
-            Ok(())
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            writeln!(stdout, "Created example configuration file: {}", path.display())?;
+            writeln!(stdout, "Edit the file to add your own variables and PGP keys.")?;
+            writeln!(
+                stdout,
+                "Note: Remove '_EXAMPLE' suffix from variable names before using them."
+            )?;
+            Ok(ExitCode::SUCCESS)
         },
     }
 }
 
-/// Handles parsing and validation of environment variable key=value data.
-struct EnvParser;
+enum ExecutionOutcome {
+    Exited(std::process::ExitStatus),
+    Printed,
+    Interrupted(i32),
+    TimedOut,
+}
 
-impl EnvParser {
-    /// Load environment variables from all `from` sources in a profile.
-    fn load_from_profile(profile: &manifest::ManifestProfile) -> Result<HashMap<String, String>> {
-        let mut env_vars = HashMap::new();
-        for from_location in profile.env.from.iter() {
-            let value = from_location.inner.resolve()?;
-            Self::parse_lines(&value, |key, val| {
-                env_vars.insert(key.to_string(), val.to_string());
-            })?;
+impl ExecutionOutcome {
+    fn exit_code(self) -> ExitCode {
+        let code = match self {
+            | Self::Exited(status) if status.success() => return ExitCode::SUCCESS,
+            | Self::Exited(status) => status.code().unwrap_or(1),
+            | Self::Printed => return ExitCode::SUCCESS,
+            | Self::Interrupted(code) => code,
+            | Self::TimedOut => 124,
+        };
+        ExitCode::from(u8::try_from(code).unwrap_or(1))
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal(ready: tokio::sync::oneshot::Sender<Result<()>>) -> i32 {
+    use tokio::signal::unix::{
+        signal,
+        SignalKind,
+    };
+
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+        | Ok(interrupt) => interrupt,
+        | Err(error) => {
+            let _ = ready.send(Err(error).context("Failed to install SIGINT handler"));
+            return 1;
+        },
+    };
+    let mut terminate = match signal(SignalKind::terminate()) {
+        | Ok(terminate) => terminate,
+        | Err(error) => {
+            let _ = ready.send(Err(error).context("Failed to install SIGTERM handler"));
+            return 1;
+        },
+    };
+    let _ = ready.send(Ok(()));
+
+    tokio::select! {
+        _ = interrupt.recv() => 130,
+        _ = terminate.recv() => 143,
+    }
+}
+
+#[cfg(windows)]
+async fn shutdown_signal(ready: tokio::sync::oneshot::Sender<Result<()>>) -> i32 {
+    let mut ctrl_c = match tokio::signal::windows::ctrl_c() {
+        | Ok(ctrl_c) => ctrl_c,
+        | Err(error) => {
+            let _ = ready.send(Err(error).context("Failed to install Ctrl-C handler"));
+            return 1;
+        },
+    };
+    let _ = ready.send(Ok(()));
+    let _ = ctrl_c.recv().await;
+    130
+}
+
+#[derive(Default)]
+struct Environment {
+    values: HashMap<String, Zeroizing<String>>,
+}
+
+impl Environment {
+    fn load(profile: &manifest::ManifestProfile) -> Result<Self> {
+        let mut environment = Self::default();
+        for source in &profile.env.from {
+            let value = Zeroizing::new(source.inner.resolve()?);
+            environment.extend_from(&value)?;
         }
-        Ok(env_vars)
+        Ok(environment)
     }
 
-    /// Parse KEY=VALUE lines from a string, validating keys and rejecting
-    /// malformed input.
-    fn parse_lines<F>(value: &str, mut callback: F) -> Result<()>
-    where
-        F: FnMut(&str, &str),
-    {
-        for (line_num, line) in value.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+    fn insert(&mut self, name: String, value: String) -> Result<()> {
+        let value = Zeroizing::new(value);
+        if !Self::is_valid_name(&name) {
+            anyhow::bail!("Invalid environment variable name '{}'", name);
+        }
+        self.values.insert(name, value);
+        Ok(())
+    }
+
+    fn extend_from(&mut self, value: &str) -> Result<()> {
+        for (line_number, line) in value.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let line_content = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-
-            if let Some(pos) = line_content.find('=') {
-                let key = line_content[..pos].trim();
-                let val = line_content[pos + 1..].trim();
-                if key.is_empty() {
-                    anyhow::bail!("Empty key at line {} in env source", line_num + 1);
-                }
-                if !Self::is_valid_key(key) {
-                    anyhow::bail!(
-                        "Invalid env var key '{}' at line {} (must be alphanumeric/underscore only)",
-                        key,
-                        line_num + 1
-                    );
-                }
-                callback(key, val);
-            } else {
-                anyhow::bail!(
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (name, value) = line.split_once('=').with_context(|| {
+                format!(
                     "Malformed line {} in env source (missing '='): '{}'",
-                    line_num + 1,
-                    trimmed
-                );
-            }
+                    line_number + 1,
+                    line
+                )
+            })?;
+            self.insert(name.trim().to_string(), value.trim().to_string())
+                .with_context(|| format!("Invalid environment variable at line {}", line_number + 1))?;
         }
         Ok(())
     }
 
-    /// Validate that an env var key contains only safe characters.
-    fn is_valid_key(key: &str) -> bool {
-        !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    fn iter(&self) -> impl Iterator<Item=(&String, &Zeroizing<String>)> {
+        self.values.iter()
     }
 
-    /// Shell-escape a string value for safe use in eval contexts.
+    fn is_valid_name(name: &str) -> bool {
+        let mut characters = name.chars();
+        matches!(characters.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+            && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+    }
+
     fn shell_escape(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 
-/// Manages creation, tracking, and cleanup of temporary secret files on disk.
-struct SecretFileManager {
-    base_dir: PathBuf,
-    created_files: Arc<Mutex<Vec<String>>>,
-}
-
-impl SecretFileManager {
-    fn new(base_dir: PathBuf) -> Self {
-        Self {
-            base_dir,
-            created_files: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    /// Validate that all file paths are within the base directory.
-    fn validate_paths<'a>(&self, paths: impl Iterator<Item = &'a String>) -> Result<()> {
-        let canonical_base = self
-            .base_dir
-            .canonicalize()
-            .with_context(|| format!("Failed to canonicalize base directory: {}", self.base_dir.display()))?;
-
-        for file_path in paths {
-            let path = Self::resolve_absolute(file_path)?;
-            if let Some(parent) = path.parent() {
-                if parent.exists() {
-                    let canonical_parent = parent
-                        .canonicalize()
-                        .with_context(|| format!("Failed to canonicalize parent: {}", parent.display()))?;
-                    if !canonical_parent.starts_with(&canonical_base) {
-                        anyhow::bail!(
-                            "File path '{}' escapes the project directory. Files must be within '{}'.",
-                            file_path,
-                            canonical_base.display()
-                        );
-                    }
-                } else {
-                    let cleaned = path_clean::PathClean::clean(&path);
-                    if !cleaned.starts_with(&canonical_base) {
-                        anyhow::bail!(
-                            "File path '{}' escapes the project directory. Files must be within '{}'.",
-                            file_path,
-                            canonical_base.display()
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Write secret content to a file with restrictive permissions, tracking it
-    /// for cleanup.
-    fn write(&self, file_path: &str, content: &str, force: bool) -> Result<()> {
-        let absolute_path = Self::resolve_absolute(file_path)?;
-
-        if absolute_path.exists() && !force {
-            anyhow::bail!(
-                "File '{}' already exists. Use --force to overwrite.",
-                absolute_path.display()
-            );
-        }
-
-        if let Some(parent) = absolute_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directories for {}", absolute_path.display()))?;
-        }
-
-        Self::write_with_permissions(&absolute_path, content)
-            .with_context(|| format!("Failed to write file {}", absolute_path.display()))?;
-
-        self.created_files
-            .lock()
-            .unwrap()
-            .push(absolute_path.to_string_lossy().to_string());
-
-        Ok(())
-    }
-
-    /// Write file content with 0o600 permissions on Unix.
-    fn write_with_permissions(path: &Path, content: &str) -> std::io::Result<()> {
-        use std::io::Write;
-
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-
-        #[cfg(unix)]
-        opts.mode(0o600);
-
-        let mut file = opts.open(path)?;
-        file.write_all(content.as_bytes())?;
-        Ok(())
-    }
-
-    /// Remove all tracked files.
-    fn cleanup_all(&self) {
-        Self::cleanup(&self.created_files);
-    }
-
-    /// Remove all files referenced by the shared file list.
-    fn cleanup(files: &Arc<Mutex<Vec<String>>>) {
-        let Ok(files) = files.lock() else {
-            eprintln!("WARNING: Failed to acquire lock for file cleanup");
-            return;
-        };
-        for file in files.iter() {
-            if let Err(e) = std::fs::remove_file(file) {
-                eprintln!("Failed to remove file '{}': {}", file, e);
-            }
-        }
-    }
-
-    /// Resolve a file path string to an absolute PathBuf.
-    fn resolve_absolute(file_path: &str) -> Result<PathBuf> {
-        let path = Path::new(file_path);
-        if path.is_absolute() {
-            Ok(path.to_path_buf())
-        } else {
-            Ok(std::env::current_dir()
-                .context("Failed to get current directory")?
-                .join(path))
-        }
-    }
-}
-
 /// Builds and executes a child process with configured environment variables.
 struct CommandExecutor<'a> {
-    cmd_args: &'a [String],
-    env_vars: &'a HashMap<String, String>,
+    command: &'a args::ChildCommand,
+    environment: &'a Environment,
     keep_env_vars: &'a Option<Vec<String>>,
 }
 
 impl<'a> CommandExecutor<'a> {
     fn new(
-        cmd_args: &'a [String],
-        env_vars: &'a HashMap<String, String>,
+        command: &'a args::ChildCommand,
+        environment: &'a Environment,
         keep_env_vars: &'a Option<Vec<String>>,
     ) -> Self {
         Self {
-            cmd_args,
-            env_vars,
+            command,
+            environment,
             keep_env_vars,
         }
     }
 
-    fn run(&self) -> Result<std::process::ExitStatus> {
-        if self.cmd_args.is_empty() {
-            return Err(anyhow::anyhow!("No command provided"));
-        }
-
-        let program = &self.cmd_args[0];
-        let args = &self.cmd_args[1..];
-
-        let mut command = Command::new(program);
-        command.args(args);
+    fn spawn(&self) -> Result<tokio::process::Child> {
+        let mut command = tokio::process::Command::new(self.command.program());
+        command.args(self.command.arguments());
 
         self.configure_env(&mut command)?;
-
-        let status = command
-            .status()
-            .with_context(|| format!("Failed to execute command: {}", program))?;
-
-        Ok(status)
+        command.kill_on_drop(true);
+        command
+            .spawn()
+            .with_context(|| format!("Failed to execute command: {}", self.command.program()))
     }
 
-    fn configure_env(&self, command: &mut Command) -> Result<()> {
+    async fn execute(
+        &self,
+        timeout: Option<std::time::Duration>,
+        shutdown: &mut tokio::sync::mpsc::Receiver<i32>,
+    ) -> Result<ExecutionOutcome> {
+        let mut child = self.spawn()?;
+        let timeout_elapsed = async move {
+            match timeout {
+                | Some(timeout) => tokio::time::sleep(timeout).await,
+                | None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(timeout_elapsed);
+
+        tokio::select! {
+            biased;
+            exit_code = shutdown.recv() => {
+                let exit_code = exit_code.context("Shutdown monitor stopped unexpectedly")?;
+                Self::terminate(&mut child, self.command.program()).await?;
+                Ok(ExecutionOutcome::Interrupted(exit_code))
+            },
+            status = child.wait() => {
+                let status = status.with_context(|| {
+                    format!("Failed to wait for command: {}", self.command.program())
+                })?;
+                Ok(ExecutionOutcome::Exited(status))
+            },
+            _ = &mut timeout_elapsed => {
+                Self::terminate(&mut child, self.command.program()).await?;
+                Ok(ExecutionOutcome::TimedOut)
+            },
+        }
+    }
+
+    async fn terminate(child: &mut tokio::process::Child, program: &str) -> Result<()> {
+        if let Err(error) = child.start_kill() {
+            if child
+                .try_wait()
+                .with_context(|| format!("Failed to inspect command after termination failed: {}", program))?
+                .is_none()
+            {
+                return Err(error).with_context(|| format!("Failed to terminate command: {}", program));
+            }
+        }
+        child
+            .wait()
+            .await
+            .with_context(|| format!("Failed to reap terminated command: {}", program))?;
+        Ok(())
+    }
+
+    fn configure_env(&self, command: &mut tokio::process::Command) -> Result<()> {
         match self.keep_env_vars {
             | None => {
-                for (key, value) in self.env_vars {
-                    command.env(key, value);
+                for (key, value) in self.environment.iter() {
+                    command.env(key, value.as_str());
                 }
             },
             | Some(patterns) => {
@@ -418,20 +489,62 @@ impl<'a> CommandExecutor<'a> {
 
                 let compiled_patterns = compiled_patterns?;
 
-                for (env_key, env_value) in std::env::vars() {
+                for (env_key, env_value) in std::env::vars_os() {
                     for pattern in &compiled_patterns {
-                        if pattern.is_match(&env_key) {
+                        if env_key.to_str().is_some_and(|key| pattern.is_match(key)) {
                             command.env(&env_key, &env_value);
                             break;
                         }
                     }
                 }
 
-                for (key, value) in self.env_vars {
-                    command.env(key, value);
+                for (key, value) in self.environment.iter() {
+                    command.env(key, value.as_str());
                 }
             },
         }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_rejects_invalid_names() {
+        let mut environment = Environment::default();
+        assert!(environment
+            .insert("VALID_NAME".to_string(), "value".to_string())
+            .is_ok());
+        assert!(environment.insert("1INVALID".to_string(), "value".to_string()).is_err());
+    }
+
+    #[tokio::test]
+    async fn command_executor_spawns_and_waits_for_child() -> Result<()> {
+        let command = args::ChildCommand::new("sh".to_string(), vec!["-c".to_string(), "exit 7".to_string()])?;
+        let environment = Environment::default();
+        let keep_env_vars = None;
+        let executor = CommandExecutor::new(&command, &environment, &keep_env_vars);
+
+        let status = executor.spawn()?.wait().await?;
+        assert_eq!(status.code(), Some(7));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_executor_terminates_a_timed_out_child() -> Result<()> {
+        let command = args::ChildCommand::new("sleep".to_string(), vec!["10".to_string()])?;
+        let environment = Environment::default();
+        let keep_env_vars = None;
+        let executor = CommandExecutor::new(&command, &environment, &keep_env_vars);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+
+        let outcome = executor
+            .execute(Some(std::time::Duration::from_millis(10)), &mut shutdown_rx)
+            .await?;
+
+        assert!(matches!(outcome, ExecutionOutcome::TimedOut));
         Ok(())
     }
 }

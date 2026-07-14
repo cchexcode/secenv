@@ -3,21 +3,28 @@ use {
         Context,
         Result,
     },
-    std::process::{
-        Command,
-        Stdio,
+    std::{
+        io::{
+            Seek,
+            Write,
+        },
+        process::{
+            Command,
+            Stdio,
+        },
     },
+    zeroize::Zeroize,
 };
 
 #[derive(Debug, Clone)]
-pub struct GpgKeySpec {
-    pub fingerprint: String,
+pub(crate) struct GpgKeySpec {
+    fingerprint: String,
 }
 
 impl GpgKeySpec {
     /// Create a new GpgKeySpec, validating the fingerprint is well-formed hex
     /// (40 or 64 chars).
-    pub fn new(fingerprint: String) -> Result<Self> {
+    pub(crate) fn new(fingerprint: String) -> Result<Self> {
         let is_valid =
             (fingerprint.len() == 40 || fingerprint.len() == 64) && fingerprint.chars().all(|c| c.is_ascii_hexdigit());
 
@@ -27,18 +34,30 @@ impl GpgKeySpec {
                 fingerprint
             );
         }
-        Ok(Self { fingerprint })
+        Ok(Self {
+            fingerprint: fingerprint.to_ascii_uppercase(),
+        })
+    }
+
+    fn as_str(&self) -> &str {
+        &self.fingerprint
     }
 }
 
-pub struct GpgManager;
+pub(crate) struct GpgManager;
 
 impl GpgManager {
-    pub fn new() -> Result<Self> {
-        Ok(Self)
+    fn status_uses_key(status: &[u8], spec: &GpgKeySpec) -> bool {
+        String::from_utf8_lossy(status).lines().any(|line| {
+            line.strip_prefix("[GNUPG:] DECRYPTION_KEY ").is_some_and(|keys| {
+                keys.split_whitespace()
+                    .take(2)
+                    .any(|key| key.eq_ignore_ascii_case(spec.as_str()))
+            })
+        })
     }
 
-    pub fn export_private_key(&self, spec: &GpgKeySpec) -> Result<String> {
+    pub(crate) fn export_private_key(&self, spec: &GpgKeySpec) -> Result<String> {
         let mut cmd = Command::new("gpg");
         cmd.args([
             "--export-secret-keys",
@@ -47,11 +66,10 @@ impl GpgManager {
             "--yes",
             "--export-options",
             "export-minimal,export-clean",
-            "--rfc4880",
-            &spec.fingerprint,
+            spec.as_str(),
         ]);
 
-        let output = cmd
+        let mut output = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -60,59 +78,92 @@ impl GpgManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("gpg failed to export private key: {}", stderr));
+            let error = anyhow::anyhow!("gpg failed to export private key: {}", stderr);
+            output.stdout.zeroize();
+            return Err(error);
         }
 
-        let private_key = String::from_utf8(output.stdout).context("GPG private key output is not valid UTF-8")?;
+        let mut private_key = match String::from_utf8(output.stdout) {
+            | Ok(private_key) => private_key,
+            | Err(error) => {
+                let mut bytes = error.into_bytes();
+                bytes.zeroize();
+                anyhow::bail!("GPG private key output is not valid UTF-8");
+            },
+        };
 
         if private_key.trim().is_empty() {
-            return Err(anyhow::anyhow!(
+            private_key.zeroize();
+            anyhow::bail!(
                 "No private key found for fingerprint: {}. Make sure the key exists in your GPG keyring.",
-                spec.fingerprint
-            ));
+                spec.as_str()
+            );
         }
 
         Ok(private_key)
     }
 
-    pub fn decrypt_data(&self, encrypted_data: &str) -> Result<String> {
-        let mut cmd = Command::new("gpg");
-        cmd.args(["--decrypt", "--batch", "--quiet"]);
+    pub(crate) fn decrypt_data(&self, spec: &GpgKeySpec, encrypted_data: &str) -> Result<String> {
+        let mut input = tempfile::tempfile().context("Failed to create temporary GPG input")?;
+        input
+            .write_all(encrypted_data.as_bytes())
+            .context("Failed to write temporary GPG input")?;
+        input.rewind().context("Failed to rewind temporary GPG input")?;
 
-        let mut child = cmd
-            .stdin(Stdio::piped())
+        let mut cmd = Command::new("gpg");
+        cmd.args([
+            "--batch",
+            "--quiet",
+            "--status-fd=2",
+            "--try-secret-key",
+            spec.as_str(),
+            "--decrypt",
+        ]);
+
+        let mut output = cmd
+            .stdin(Stdio::from(input))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to spawn gpg process for decryption")?;
-
-        if let Some(stdin) = child.stdin.take() {
-            use std::io::Write;
-            let mut stdin = stdin;
-            stdin
-                .write_all(encrypted_data.as_bytes())
-                .context("Failed to write encrypted data to gpg stdin")?;
-        }
-
-        let output = child
-            .wait_with_output()
-            .context("Failed to wait for gpg decryption process")?;
+            .output()
+            .context("Failed to execute gpg process for decryption")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("GPG failed to decrypt data: {}", stderr));
+            let error = anyhow::anyhow!("GPG failed to decrypt data: {}", stderr);
+            output.stdout.zeroize();
+            return Err(error);
         }
 
-        let decrypted_data = String::from_utf8(output.stdout).context("GPG decrypted output is not valid UTF-8")?;
+        if !Self::status_uses_key(&output.stderr, spec) {
+            output.stdout.zeroize();
+            anyhow::bail!("GPG did not decrypt with configured fingerprint {}", spec.as_str());
+        }
 
-        Ok(decrypted_data)
+        match String::from_utf8(output.stdout) {
+            | Ok(decrypted_data) => Ok(decrypted_data),
+            | Err(error) => {
+                let mut bytes = error.into_bytes();
+                bytes.zeroize();
+                anyhow::bail!("GPG decrypted output is not valid UTF-8");
+            },
+        }
     }
+}
 
-    /// Decrypt data using a validated key spec (convenience method for callers
-    /// that already have a spec).
-    pub fn decrypt_data_with_spec(&self, _spec: &GpgKeySpec, encrypted_data: &str) -> Result<String> {
-        // GPG uses its keyring for decryption; the spec validates the fingerprint but
-        // the actual key selection is handled by gpg internally.
-        self.decrypt_data(encrypted_data)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verifies_the_decryption_fingerprint() -> Result<()> {
+        let fingerprint = "0123456789abcdef0123456789abcdef01234567";
+        let spec = GpgKeySpec::new(fingerprint.to_string())?;
+        let status = format!("[GNUPG:] DECRYPTION_KEY subkey {} -\n", fingerprint);
+        assert!(GpgManager::status_uses_key(status.as_bytes(), &spec));
+        assert!(!GpgManager::status_uses_key(
+            b"[GNUPG:] DECRYPTION_KEY other another -\n",
+            &spec
+        ));
+        Ok(())
     }
 }

@@ -3,84 +3,100 @@ use {
         Context,
         Result,
     },
+    base64::Engine,
     std::process::{
         Command,
         Stdio,
     },
+    zeroize::Zeroize,
 };
 
 #[derive(Debug, Clone)]
-pub struct GcpSecretSpec {
+pub(crate) struct GcpSecretSpec {
     // Fully qualified: projects/{project}/secrets/{secret}
-    pub secret: String,
+    pub(crate) secret: String,
     // Optional version (defaults to latest)
-    pub version: Option<String>,
+    pub(crate) version: Option<String>,
 }
 
 impl GcpSecretSpec {
-    /// Parse a GCP secret FQN into (project, secret_name, optional_version).
-    /// Accepts:
-    ///   projects/<project>/secrets/<secret>
-    ///   projects/<project>/secrets/<secret>/versions/<version>
-    fn parse_fqn(&self) -> Result<(String, String, Option<String>)> {
+    fn parse_fqn(&self) -> Result<(&str, &str, Option<&str>)> {
         let parts: Vec<&str> = self.secret.split('/').collect();
-        if parts.len() < 4 || parts[0] != "projects" || parts[2] != "secrets" {
-            return Err(anyhow::anyhow!("Invalid secret resource: {}", self.secret));
+        match parts.as_slice() {
+            | ["projects", project, "secrets", secret] if !project.is_empty() && !secret.is_empty() => {
+                Ok((project, secret, None))
+            },
+            | ["projects", project, "secrets", secret, "versions", version]
+                if !project.is_empty() && !secret.is_empty() && !version.is_empty() && !version.starts_with('-') =>
+            {
+                Ok((project, secret, Some(version)))
+            },
+            | _ => anyhow::bail!("Invalid GCP secret resource: {}", self.secret),
         }
-        let project = parts[1].to_string();
-        let secret_name = parts[3].to_string();
-
-        let version = if parts.len() >= 6 && parts[4] == "versions" {
-            Some(parts[5].to_string())
-        } else {
-            None
-        };
-
-        Ok((project, secret_name, version))
     }
 
     /// Resolve the effective version, considering FQN-embedded version and
     /// explicit version field.
-    fn effective_version(&self, fqn_version: &Option<String>) -> String {
-        if fqn_version.is_some() && self.version.is_some() && fqn_version != &self.version {
-            eprintln!(
-                "WARNING: Version '{}' specified in secret FQN conflicts with explicit version '{}'. Using explicit \
-                 version.",
-                fqn_version.as_deref().unwrap_or(""),
-                self.version.as_deref().unwrap_or("")
-            );
+    fn effective_version<'a>(&'a self, fqn_version: Option<&'a str>) -> Result<&'a str> {
+        if let (Some(fqn_version), Some(version)) = (fqn_version, self.version.as_deref()) {
+            if fqn_version != version {
+                anyhow::bail!(
+                    "GCP secret version '{}' conflicts with explicit version '{}'",
+                    fqn_version,
+                    version
+                );
+            }
         }
-
-        self.version
-            .as_deref()
-            .or(fqn_version.as_deref())
-            .unwrap_or("latest")
-            .to_string()
+        let version = self.version.as_deref().or(fqn_version).unwrap_or("latest");
+        if version.is_empty() || version.starts_with('-') {
+            anyhow::bail!("Invalid GCP secret version: '{}'", version);
+        }
+        Ok(version)
     }
 }
 
-pub struct GcpSecretManager;
+pub(crate) struct GcpSecretManager;
 
 impl GcpSecretManager {
-    pub fn new() -> Result<Self> {
-        Ok(Self)
+    fn decode_payload(encoded: &mut Vec<u8>) -> Result<String> {
+        let payload = std::str::from_utf8(encoded)
+            .context("GCP secret payload is not valid base64 text")?
+            .trim();
+        let decoded = base64::engine::general_purpose::URL_SAFE.decode(payload);
+        encoded.zeroize();
+        let decoded = decoded.context("GCP secret payload is not valid base64")?;
+        match String::from_utf8(decoded) {
+            | Ok(value) => Ok(value),
+            | Err(error) => {
+                let mut bytes = error.into_bytes();
+                bytes.zeroize();
+                anyhow::bail!("Secret value is not valid UTF-8");
+            },
+        }
     }
 
-    pub fn access_secret(&self, spec: &GcpSecretSpec) -> Result<String> {
+    pub(crate) fn access_secret(&self, spec: &GcpSecretSpec) -> Result<String> {
         let (project, secret_name, fqn_version) = spec
             .parse_fqn()
             .context("Invalid GCP secret format. Expected 'projects/<project>/secrets/<name>'")?;
 
-        let version = spec.effective_version(&fqn_version);
+        let version = spec.effective_version(fqn_version)?;
 
         let mut cmd = Command::new("gcloud");
-        cmd.args(["secrets", "versions", "access", &version, "--quiet"])
-            .arg("--secret")
-            .arg(&secret_name)
-            .arg("--project")
-            .arg(&project);
+        cmd.args([
+            "secrets",
+            "versions",
+            "access",
+            version,
+            "--quiet",
+            "--format=get(payload.data)",
+        ])
+        .arg("--secret")
+        .arg(secret_name)
+        .arg("--project")
+        .arg(project);
 
-        let output = cmd
+        let mut output = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -89,10 +105,45 @@ impl GcpSecretManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("gcloud failed: {}", stderr));
+            let error = anyhow::anyhow!("gcloud failed: {}", stderr);
+            output.stdout.zeroize();
+            return Err(error);
         }
 
-        let value = String::from_utf8(output.stdout).context("Secret value is not valid UTF-8")?;
-        Ok(value.trim_end_matches(['\n', '\r']).to_string())
+        Self::decode_payload(&mut output.stdout)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_secret_resources_and_versions() -> Result<()> {
+        let spec = GcpSecretSpec {
+            secret: "projects/project/secrets/name/versions/7".to_string(),
+            version: None,
+        };
+        let (_, _, version) = spec.parse_fqn()?;
+        assert_eq!(spec.effective_version(version)?, "7");
+
+        for invalid in [
+            "projects//secrets/name",
+            "projects/project/secrets/name/garbage",
+            "projects/project/secrets/name/versions/--help",
+        ] {
+            let spec = GcpSecretSpec {
+                secret: invalid.to_string(),
+                version: None,
+            };
+            assert!(spec.parse_fqn().is_err());
+        }
+
+        let mut encoded = base64::engine::general_purpose::URL_SAFE
+            .encode("secret with newline\n")
+            .into_bytes();
+        encoded.push(b'\n');
+        assert_eq!(GcpSecretManager::decode_payload(&mut encoded)?, "secret with newline\n");
+        Ok(())
     }
 }

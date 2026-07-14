@@ -18,6 +18,7 @@ use {
         Result,
     },
     base64::Engine,
+    hocon::HoconLoader,
     semver::Version,
     serde::{
         Deserialize,
@@ -28,11 +29,12 @@ use {
         fmt,
         path::PathBuf,
     },
+    zeroize::Zeroizing,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EncodedValue {
+pub(crate) enum EncodedValue {
     Literal(String),
     Base64(String),
 }
@@ -47,7 +49,7 @@ impl fmt::Debug for EncodedValue {
 }
 
 impl EncodedValue {
-    pub fn get_value(&self) -> Result<String, anyhow::Error> {
+    pub(crate) fn decode(&self) -> Result<String> {
         match self {
             | EncodedValue::Literal(value) => Ok(value.clone()),
             | EncodedValue::Base64(value) => {
@@ -63,9 +65,9 @@ impl EncodedValue {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct EncodedValueWrapper {
+pub(crate) struct EncodedValueWrapper {
     #[serde(flatten)]
-    pub inner: EncodedValue,
+    pub(crate) inner: EncodedValue,
 }
 
 impl fmt::Debug for EncodedValueWrapper {
@@ -78,7 +80,7 @@ impl fmt::Debug for EncodedValueWrapper {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SecretAllocation {
+pub(crate) enum SecretAllocation {
     Literal(EncodedValue),
     File(String),
     Gpg {
@@ -108,38 +110,40 @@ impl fmt::Debug for SecretAllocation {
 }
 
 impl SecretAllocation {
-    pub fn get_value(&self) -> Result<String, anyhow::Error> {
+    pub(crate) fn resolve(&self) -> Result<String> {
         match self {
-            | SecretAllocation::Literal(encoded_value) => encoded_value.get_value(),
+            | SecretAllocation::Literal(encoded_value) => encoded_value.decode(),
             | SecretAllocation::File(file_path) => {
                 std::fs::read_to_string(file_path).context(format!("Failed to read file: {}", file_path))
             },
             | SecretAllocation::Gpg { fingerprint } => {
                 let spec = GpgKeySpec::new(fingerprint.clone())?;
-                let gpg = GpgManager::new().context("Failed to initialize GPG manager")?;
-                gpg.export_private_key(&spec)
+                GpgManager
+                    .export_private_key(&spec)
                     .context("Failed to export GPG private key")
             },
             | SecretAllocation::Gcp { secret, version } => {
-                let gcp = GcpSecretManager::new().context("Failed to initialize GCP Secret Manager client")?;
                 let spec = GcpSecretSpec {
                     secret: secret.clone(),
                     version: version.clone(),
                 };
-                gcp.access_secret(&spec).context("Failed to access GCP secret")
+                GcpSecretManager
+                    .access_secret(&spec)
+                    .context("Failed to access GCP secret")
             },
             | SecretAllocation::Aws {
                 secret,
                 version,
                 region,
             } => {
-                let aws = AwsSecretManager::new().context("Failed to initialize AWS Secret Manager client")?;
                 let spec = AwsSecretSpec {
                     secret: secret.clone(),
                     version: version.clone(),
                     region: region.clone(),
                 };
-                aws.access_secret(&spec).context("Failed to access AWS secret")
+                AwsSecretManager
+                    .access_secret(&spec)
+                    .context("Failed to access AWS secret")
             },
         }
     }
@@ -147,41 +151,95 @@ impl SecretAllocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct SecretAllocationWrapper {
+pub(crate) struct SecretAllocationWrapper {
     #[serde(flatten)]
-    pub inner: SecretAllocation,
+    pub(crate) inner: SecretAllocation,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Secret {
-    #[serde(rename = "pgp")]
-    PGP(SecretAllocationWrapper),
+pub(crate) enum RemoteSecretAllocation {
+    Gcp {
+        secret: String,
+        version: Option<String>,
+    },
+    Aws {
+        secret: String,
+        version: Option<String>,
+        region: Option<String>,
+    },
 }
 
-impl fmt::Debug for Secret {
+impl fmt::Debug for RemoteSecretAllocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            | Secret::PGP(alloc) => write!(f, "PGP({:?})", alloc),
+            | Self::Gcp { secret, .. } => write!(f, "Gcp(secret={})", secret),
+            | Self::Aws { secret, .. } => write!(f, "Aws(secret={})", secret),
+        }
+    }
+}
+
+impl RemoteSecretAllocation {
+    pub(crate) fn resolve(&self) -> Result<String> {
+        match self {
+            | Self::Gcp { secret, version } => {
+                GcpSecretManager.access_secret(&GcpSecretSpec {
+                    secret: secret.clone(),
+                    version: version.clone(),
+                })
+            },
+            | Self::Aws {
+                secret,
+                version,
+                region,
+            } => {
+                AwsSecretManager.access_secret(&AwsSecretSpec {
+                    secret: secret.clone(),
+                    version: version.clone(),
+                    region: region.clone(),
+                })
+            },
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct SecretWrapper {
+pub(crate) struct RemoteSecretAllocationWrapper {
     #[serde(flatten)]
-    pub inner: Secret,
+    pub(crate) inner: RemoteSecretAllocation,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Secret {
+    #[serde(rename = "pgp")]
+    Pgp(SecretAllocationWrapper),
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            | Secret::Pgp(alloc) => write!(f, "Pgp({:?})", alloc),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct SecretWrapper {
+    #[serde(flatten)]
+    pub(crate) inner: Secret,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct Manifest {
-    pub version: String,
+pub(crate) struct Manifest {
+    pub(crate) version: String,
     #[serde(skip)]
-    pub source_path: PathBuf,
+    source_path: PathBuf,
     #[serde(default)]
-    pub profiles: HashMap<String, ManifestProfile>,
+    pub(crate) profiles: HashMap<String, ManifestProfile>,
 }
 
 impl fmt::Debug for Manifest {
@@ -195,7 +253,24 @@ impl fmt::Debug for Manifest {
 }
 
 impl Manifest {
-    pub fn validate_version(&self) -> Result<()> {
+    pub(crate) fn load(source_path: PathBuf) -> Result<Self> {
+        let content = Zeroizing::new(
+            std::fs::read_to_string(&source_path)
+                .with_context(|| format!("Failed to read config file: {}", source_path.display()))?,
+        );
+        let mut manifest: Self = HoconLoader::new()
+            .no_system()
+            .strict()
+            .load_str(&content)
+            .with_context(|| format!("Failed to parse HOCON config: {}", source_path.display()))?
+            .resolve()
+            .with_context(|| format!("Failed to deserialize HOCON config: {}", source_path.display()))?;
+        manifest.source_path = source_path;
+        manifest.validate_version()?;
+        Ok(manifest)
+    }
+
+    pub(crate) fn validate_version(&self) -> Result<()> {
         let cli_version = Version::parse(env!("CARGO_PKG_VERSION")).context("Failed to parse CLI version")?;
 
         #[cfg(debug_assertions)]
@@ -222,19 +297,12 @@ impl Manifest {
             ));
         }
 
-        if config_version.minor > cli_version.minor {
-            eprintln!(
-                "Warning: Config version {} has newer minor version than CLI version {}. Some features may not work.",
-                config_version, cli_version
-            );
-        }
-
         Ok(())
     }
 
     /// Warn if the config file has insecure permissions (group/world-writable).
     #[cfg(unix)]
-    pub fn warn_if_insecure_permissions(&self) {
+    pub(crate) fn warn_if_insecure_permissions(&self) {
         use std::os::unix::fs::MetadataExt;
         if let Ok(meta) = std::fs::metadata(&self.source_path) {
             let mode = meta.mode();
@@ -256,10 +324,10 @@ impl Manifest {
     }
 
     #[cfg(not(unix))]
-    pub fn warn_if_insecure_permissions(&self) {}
+    pub(crate) fn warn_if_insecure_permissions(&self) {}
 
     /// Build an example manifest suitable for `init`.
-    pub fn example(source_path: PathBuf) -> Self {
+    pub(crate) fn example(source_path: PathBuf) -> Self {
         let mut vars = HashMap::new();
 
         vars.insert("APP_NAME".to_string(), ContentWrapper {
@@ -273,7 +341,7 @@ impl Manifest {
         vars.insert("SECRET_TOKEN_EXAMPLE".to_string(), ContentWrapper {
             inner: Content::Secure {
                 secret: SecretWrapper {
-                    inner: Secret::PGP(SecretAllocationWrapper {
+                    inner: Secret::Pgp(SecretAllocationWrapper {
                         inner: SecretAllocation::File("/path/to/private.key".to_string()),
                     }),
                 },
@@ -286,7 +354,7 @@ impl Manifest {
         vars.insert("API_KEY_EXAMPLE".to_string(), ContentWrapper {
             inner: Content::Secure {
                 secret: SecretWrapper {
-                    inner: Secret::PGP(SecretAllocationWrapper {
+                    inner: Secret::Pgp(SecretAllocationWrapper {
                         inner: SecretAllocation::Gcp {
                             secret: "projects/myproject/secrets/my-pgp-key".to_string(),
                             version: Some("latest".to_string()),
@@ -302,7 +370,7 @@ impl Manifest {
         vars.insert("GPG_ENCRYPTED_EXAMPLE".to_string(), ContentWrapper {
             inner: Content::Secure {
                 secret: SecretWrapper {
-                    inner: Secret::PGP(SecretAllocationWrapper {
+                    inner: Secret::Pgp(SecretAllocationWrapper {
                         inner: SecretAllocation::Gpg {
                             fingerprint: "1E1BAC706C352094D490D5393F5167F1F3002043".to_string(),
                         },
@@ -323,7 +391,7 @@ impl Manifest {
         files.insert("./credentials.key".to_string(), ContentWrapper {
             inner: Content::Secure {
                 secret: SecretWrapper {
-                    inner: Secret::PGP(SecretAllocationWrapper {
+                    inner: Secret::Pgp(SecretAllocationWrapper {
                         inner: SecretAllocation::File("/path/to/private.key".to_string()),
                     }),
                 },
@@ -349,12 +417,13 @@ impl Manifest {
         });
 
         let default_profile = ManifestProfile {
+            sealed: None,
             files,
             env: ManifestEnv {
                 keep: Some(vec!["^PATH$".to_string(), "^LC_.*".to_string()]),
                 vars,
                 from: vec![FromLocationWrapper {
-                    inner: FromLocation::GCS {
+                    inner: FromLocation::Gcs {
                         secret: "projects/myproject/secrets/my-gcs-secret".to_string(),
                         version: Some("latest".to_string()),
                     },
@@ -374,26 +443,80 @@ impl Manifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct ManifestProfile {
-    #[serde(default)]
-    pub files: HashMap<String, ContentWrapper>,
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) struct ManifestProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sealed: Option<SealedFiles>,
 
     #[serde(default)]
-    pub env: ManifestEnv,
+    pub(crate) files: HashMap<String, ContentWrapper>,
+
+    #[serde(default)]
+    pub(crate) env: ManifestEnv,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) struct SealedFiles {
+    /// HOCON or JSON files replaced with their decrypted form for the command
+    /// lifetime, then restored.
+    #[serde(default)]
+    pub(crate) files: HashMap<String, SealedFile>,
+
+    /// Temporary output path to encrypted template path.
+    #[serde(default)]
+    pub(crate) templates: HashMap<String, SealedTemplate>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FromLocation {
+pub(crate) enum SealedSecret {
+    Pgp(RemoteSecretAllocationWrapper),
+    Argon2idXchacha20Poly1305(RemoteSecretAllocationWrapper),
+}
+
+impl fmt::Debug for SealedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            | Self::Pgp(allocation) => write!(f, "Pgp({:?})", allocation),
+            | Self::Argon2idXchacha20Poly1305(allocation) => {
+                write!(f, "Argon2idXchacha20Poly1305({:?})", allocation)
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct SealedSecretWrapper {
+    #[serde(flatten)]
+    pub(crate) inner: SealedSecret,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) struct SealedFile {
+    pub(crate) secret: SealedSecretWrapper,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) struct SealedTemplate {
+    pub(crate) source: String,
+    pub(crate) secret: SealedSecretWrapper,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FromLocation {
     File(String),
     #[serde(rename = "gcs")]
-    GCS {
+    Gcs {
         secret: String,
         version: Option<String>,
     },
     #[serde(rename = "aws")]
-    AWS {
+    Aws {
         secret: String,
         version: Option<String>,
         region: Option<String>,
@@ -404,36 +527,34 @@ impl fmt::Debug for FromLocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             | FromLocation::File(path) => write!(f, "File({})", path),
-            | FromLocation::GCS { secret, .. } => write!(f, "GCS({})", secret),
-            | FromLocation::AWS { secret, .. } => write!(f, "AWS({})", secret),
+            | FromLocation::Gcs { secret, .. } => write!(f, "Gcs({})", secret),
+            | FromLocation::Aws { secret, .. } => write!(f, "Aws({})", secret),
         }
     }
 }
 
 impl FromLocation {
     /// Fetch the raw string content from this source.
-    pub fn resolve(&self) -> Result<String> {
+    pub(crate) fn resolve(&self) -> Result<String> {
         match self {
-            | FromLocation::GCS { secret, version } => {
-                let gcp = GcpSecretManager::new().context("Failed to initialize GCP Secret Manager client")?;
+            | FromLocation::Gcs { secret, version } => {
                 let spec = GcpSecretSpec {
                     secret: secret.to_string(),
                     version: version.as_ref().map(|v| v.to_string()),
                 };
-                gcp.access_secret(&spec)
+                GcpSecretManager.access_secret(&spec)
             },
-            | FromLocation::AWS {
+            | FromLocation::Aws {
                 secret,
                 version,
                 region,
             } => {
-                let aws = AwsSecretManager::new().context("Failed to initialize AWS Secret Manager client")?;
                 let spec = AwsSecretSpec {
                     secret: secret.to_string(),
                     version: version.as_ref().map(|v| v.to_string()),
                     region: region.as_ref().map(|r| r.to_string()),
                 };
-                aws.access_secret(&spec)
+                AwsSecretManager.access_secret(&spec)
             },
             | FromLocation::File(file_path) => {
                 std::fs::read_to_string(file_path).context(format!("Failed to read env file: {}", file_path))
@@ -444,27 +565,27 @@ impl FromLocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct FromLocationWrapper {
+pub(crate) struct FromLocationWrapper {
     #[serde(flatten)]
-    pub inner: FromLocation,
+    pub(crate) inner: FromLocation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub struct ManifestEnv {
+pub(crate) struct ManifestEnv {
     #[serde(default)]
-    pub keep: Option<Vec<String>>,
+    pub(crate) keep: Option<Vec<String>>,
 
     #[serde(default)]
-    pub vars: HashMap<String, ContentWrapper>,
+    pub(crate) vars: HashMap<String, ContentWrapper>,
 
     #[serde(default)]
-    pub from: Vec<FromLocationWrapper>,
+    pub(crate) from: Vec<FromLocationWrapper>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Content {
+pub(crate) enum Content {
     Plain(EncodedValue),
 
     Secure {
@@ -504,25 +625,25 @@ impl fmt::Debug for Content {
 }
 
 impl Content {
-    pub fn get_value(&self, pgp_manager: &mut crate::pgp::PgpManager) -> Result<String, anyhow::Error> {
+    pub(crate) fn resolve(&self, pgp_manager: &mut crate::pgp::PgpManager) -> Result<String> {
         match self {
-            | Content::Plain(encoded_value) => encoded_value.get_value(),
+            | Content::Plain(encoded_value) => encoded_value.decode(),
             | Content::Secure { secret, value } => {
-                let encrypted_data = value.inner.get_value()?;
+                let encrypted_data = value.inner.decode()?;
 
                 match &secret.inner {
-                    | Secret::PGP(allocation_wrapper) => {
+                    | Secret::Pgp(allocation_wrapper) => {
                         match &allocation_wrapper.inner {
                             | SecretAllocation::Gpg { fingerprint } => {
                                 let spec = GpgKeySpec::new(fingerprint.clone())?;
-                                let gpg = GpgManager::new().context("Failed to initialize GPG manager")?;
-                                gpg.decrypt_data_with_spec(&spec, &encrypted_data)
+                                GpgManager
+                                    .decrypt_data(&spec, &encrypted_data)
                                     .context("Failed to decrypt value with GPG")
                             },
                             | _ => {
-                                let pgp_key = allocation_wrapper.inner.get_value()?;
+                                let pgp_key = Zeroizing::new(allocation_wrapper.inner.resolve()?);
                                 pgp_manager
-                                    .decrypt(&pgp_key, &encrypted_data)
+                                    .decrypt(pgp_key.as_str(), &encrypted_data)
                                     .context("Failed to decrypt value with PGP key")
                             },
                         }
@@ -533,25 +654,27 @@ impl Content {
                 std::fs::read_to_string(file_path).context(format!("Failed to read file: {}", file_path))
             },
             | Content::Gcs { secret, version } => {
-                let gcp = GcpSecretManager::new().context("Failed to initialize GCP Secret Manager client")?;
                 let spec = GcpSecretSpec {
                     secret: secret.clone(),
                     version: version.clone(),
                 };
-                gcp.access_secret(&spec).context("Failed to access GCP secret")
+                GcpSecretManager
+                    .access_secret(&spec)
+                    .context("Failed to access GCP secret")
             },
             | Content::Aws {
                 secret,
                 version,
                 region,
             } => {
-                let aws = AwsSecretManager::new().context("Failed to initialize AWS Secret Manager client")?;
                 let spec = AwsSecretSpec {
                     secret: secret.clone(),
                     version: version.clone(),
                     region: region.clone(),
                 };
-                aws.access_secret(&spec).context("Failed to access AWS secret")
+                AwsSecretManager
+                    .access_secret(&spec)
+                    .context("Failed to access AWS secret")
             },
         }
     }
@@ -559,7 +682,90 @@ impl Content {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ContentWrapper {
+pub(crate) struct ContentWrapper {
     #[serde(flatten)]
-    pub inner: Content,
+    pub(crate) inner: Content,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_profiles_remain_compatible() -> Result<()> {
+        let manifest: Manifest = hocon::de::from_str(
+            r#"
+            version = "0.0.0"
+            profiles.default.env.vars.APP_NAME.plain.literal = "myapp"
+            "#,
+        )?;
+
+        let profile = manifest.profiles.get("default").context("Missing default profile")?;
+        assert!(profile.sealed.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_profile_sealed_files_and_templates() -> Result<()> {
+        let manifest: Manifest = hocon::de::from_str(
+            r#"
+            version = "0.0.0"
+            profiles.default.sealed {
+              files {
+                "./application.conf" {
+                  secret.pgp.gcp.secret = "projects/example/secrets/application-pgp-key"
+                }
+              }
+              templates {
+                "./credentials.json" {
+                  source = "./credentials.json.sealed"
+                  secret.argon2id_xchacha20_poly1305.gcp.secret = "projects/example/secrets/credentials-passphrase"
+                }
+              }
+            }
+            "#,
+        )?;
+
+        let sealed = manifest
+            .profiles
+            .get("default")
+            .and_then(|profile| profile.sealed.as_ref())
+            .context("Missing sealed profile configuration")?;
+        assert_eq!(
+            sealed
+                .templates
+                .get("./credentials.json")
+                .map(|template| template.source.as_str()),
+            Some("./credentials.json.sealed")
+        );
+        assert!(sealed.files.contains_key("./application.conf"));
+        assert!(matches!(
+            sealed.files["./application.conf"].secret.inner,
+            SealedSecret::Pgp(RemoteSecretAllocationWrapper {
+                inner: RemoteSecretAllocation::Gcp { .. }
+            })
+        ));
+        assert!(matches!(
+            sealed.templates["./credentials.json"].secret.inner,
+            SealedSecret::Argon2idXchacha20Poly1305(RemoteSecretAllocationWrapper {
+                inner: RemoteSecretAllocation::Gcp { .. }
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_local_sealed_secrets() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("secenv.conf");
+        std::fs::write(
+            &path,
+            r#"
+            version = "0.0.0"
+            profiles.default.sealed.files."./application.conf".secret.pgp.file = "private.key"
+            "#,
+        )?;
+        assert!(Manifest::load(path).is_err());
+        Ok(())
+    }
 }
