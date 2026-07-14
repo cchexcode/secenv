@@ -102,6 +102,7 @@ profiles.default {
 
 Notes:
 - The config file can be in JSON or HOCON format (HOCON is a superset of JSON).
+- Relative file and sealed-template paths are resolved from the config file's directory.
 - Use `secenv init` to generate a JSON example file, or write your own in HOCON format.
 - The `version` field is validated against the CLI version. The config cannot be newer than the CLI, and major versions must match.
 - Supported secret sources for PGP private keys: `secret.pgp.literal`, `secret.pgp.file`, `secret.pgp.gpg.fingerprint`, `secret.pgp.gcp.secret` (+ optional `.version`).

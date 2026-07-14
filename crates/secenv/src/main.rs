@@ -68,9 +68,7 @@ async fn main() -> Result<ExitCode> {
                 .with_context(|| format!("Profile '{}' not found in manifest", profile_name))?;
 
             let generated_files: Vec<_> = profile.files.keys().cloned().collect();
-            let sealed_file_manager = crate::sealed::SealedFileManager::new(
-                std::env::current_dir().context("Failed to get current directory")?,
-            )?;
+            let sealed_file_manager = crate::sealed::SealedFileManager::new(manifest.source_directory()?)?;
             sealed_file_manager.validate_profile(profile.sealed.as_ref(), &generated_files, force)?;
 
             let mut environment = Environment::load(profile)?;
@@ -205,9 +203,7 @@ async fn main() -> Result<ExitCode> {
                 .sealed
                 .as_ref()
                 .with_context(|| format!("Profile '{}' has no sealed files", profile_name))?;
-            let manager = crate::sealed::SealedFileManager::new(
-                std::env::current_dir().context("Failed to get current directory")?,
-            )?;
+            let manager = crate::sealed::SealedFileManager::new(manifest.source_directory()?)?;
             let pgp_manager = crate::pgp::PgpManager::default();
 
             let marker = match input {

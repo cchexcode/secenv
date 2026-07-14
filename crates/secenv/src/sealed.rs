@@ -1428,6 +1428,22 @@ mod tests {
     }
 
     #[test]
+    fn manifest_directory_is_the_sealed_path_base() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let project = directory.path().join("project");
+        fs::create_dir(&project)?;
+        let manifest = crate::manifest::Manifest::example(project.join("secenv.conf"));
+        let manager = SealedFileManager::new(manifest.source_directory()?)?;
+
+        let output = project.join("generated.secret");
+        manager.write_generated("./generated.secret", "plaintext", false)?;
+        assert_eq!(fs::read_to_string(&output)?, "plaintext");
+        manager.restore_all()?;
+        assert!(!output.exists());
+        Ok(())
+    }
+
+    #[test]
     fn force_restores_an_existing_template_output() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let template = directory.path().join("credentials.json.sealed");

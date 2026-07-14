@@ -270,6 +270,13 @@ impl Manifest {
         Ok(manifest)
     }
 
+    pub(crate) fn source_directory(&self) -> Result<PathBuf> {
+        self.source_path
+            .parent()
+            .map(PathBuf::from)
+            .with_context(|| format!("Config file '{}' has no parent directory", self.source_path.display()))
+    }
+
     pub(crate) fn validate_version(&self) -> Result<()> {
         let cli_version = Version::parse(env!("CARGO_PKG_VERSION")).context("Failed to parse CLI version")?;
 
