@@ -11,7 +11,6 @@ use {
             SealedSecret,
             SealedSecretWrapper,
             SealedTemplate,
-            SecretAllocation,
         },
         password_cipher::PasswordCipher,
         pgp::PgpManager,
@@ -206,9 +205,59 @@ struct SelectedFile<'a> {
     secret: &'a SealedSecretWrapper,
 }
 
-struct LoadedSecret {
+pub(crate) struct ResolvedSealedSecret {
     algorithm: SealedAlgorithm,
     value: Zeroizing<String>,
+}
+
+impl ResolvedSealedSecret {
+    pub(crate) fn load(secret: &SealedSecretWrapper, removed_env_vars: &[String]) -> Result<Self> {
+        let (algorithm, allocation) = match &secret.inner {
+            | SealedSecret::Pgp(allocation) => (SealedAlgorithm::Pgp, &allocation.inner),
+            | SealedSecret::Argon2idXchacha20Poly1305(allocation) => {
+                (SealedAlgorithm::Argon2idXchacha20Poly1305, &allocation.inner)
+            },
+        };
+        Ok(Self {
+            algorithm,
+            value: Zeroizing::new(
+                allocation
+                    .resolve(removed_env_vars)
+                    .context("Failed to load sealed encryption secret")?,
+            ),
+        })
+    }
+
+    pub(crate) fn seal_marker(&self, plaintext: &str, pgp_manager: &PgpManager) -> Result<String> {
+        let ciphertext = match self.algorithm {
+            | SealedAlgorithm::Pgp => {
+                pgp_manager
+                    .encrypt(self.value.as_str(), plaintext)
+                    .context("Failed to encrypt sealed value with PGP")?
+            },
+            | SealedAlgorithm::Argon2idXchacha20Poly1305 => PasswordCipher::encrypt(self.value.as_str(), plaintext)?,
+        };
+        Ok(format!(
+            "{}{}]",
+            self.algorithm.marker_prefix(),
+            base64::engine::general_purpose::STANDARD.encode(ciphertext)
+        ))
+    }
+
+    pub(crate) fn open_marker(&self, marker: &str, pgp_manager: &mut PgpManager) -> Result<String> {
+        let ciphertext = SealedDocument::decode_marker_for(marker, self.algorithm)
+            .context("Invalid sealed value")?
+            .context("Value must be a complete ENC[<algorithm>,<base64>] marker")?;
+        self.decrypt_payload(&ciphertext, pgp_manager)
+            .context("Failed to decrypt sealed value")
+    }
+
+    fn decrypt_payload(&self, ciphertext: &[u8], pgp_manager: &mut PgpManager) -> Result<String> {
+        match self.algorithm {
+            | SealedAlgorithm::Pgp => pgp_manager.decrypt_bytes(self.value.as_str(), ciphertext),
+            | SealedAlgorithm::Argon2idXchacha20Poly1305 => PasswordCipher::decrypt(self.value.as_str(), ciphertext),
+        }
+    }
 }
 
 impl PreparedFiles {
@@ -269,15 +318,10 @@ impl SealedFileManager {
             .map(|file| &file.secret)
             .chain(prepared.templates.iter().map(|template| &template.secret))
         {
-            let (algorithm, allocation) = Self::secret_allocation(secret);
-            loaded_secrets.push(LoadedSecret {
-                algorithm,
-                value: Zeroizing::new(
-                    allocation
-                        .resolve(removed_env_vars)
-                        .context("Failed to load encryption secret for sealed file")?,
-                ),
-            });
+            loaded_secrets.push(
+                ResolvedSealedSecret::load(secret, removed_env_vars)
+                    .context("Failed to load encryption secret for sealed file")?,
+            );
         }
 
         let mut loaded_secrets = loaded_secrets.iter();
@@ -287,12 +331,7 @@ impl SealedFileManager {
                 let loaded_secret = loaded_secrets
                     .next()
                     .context("Missing preloaded encryption secret for sealed file")?;
-                SealedDocument::decrypt(
-                    document,
-                    loaded_secret.algorithm,
-                    loaded_secret.value.as_str(),
-                    pgp_manager,
-                )
+                SealedDocument::decrypt(document, loaded_secret, pgp_manager)
             },
             &mut cancelled,
         )
@@ -371,7 +410,7 @@ impl SealedFileManager {
         self.prepare(&config.files, &config.templates, &[], true)
             .context("Invalid sealed file configuration")?;
         let selected = Self::select_file(config, configured_file)?;
-        Self::encrypt_marker(selected.secret, plaintext, pgp_manager, removed_env_vars)
+        ResolvedSealedSecret::load(selected.secret, removed_env_vars)?.seal_marker(plaintext, pgp_manager)
     }
 
     pub(crate) fn seal_path(
@@ -390,8 +429,9 @@ impl SealedFileManager {
         let contents = Zeroizing::new(contents);
         let document = std::str::from_utf8(&contents)
             .with_context(|| format!("Sealed source '{}' is not valid UTF-8", source_path.display()))?;
+        let secret = ResolvedSealedSecret::load(selected.secret, removed_env_vars)?;
         let (rendered, marker) = SealedDocument::seal_path_with(document, json_pointer, |plaintext| {
-            Self::encrypt_marker(selected.secret, plaintext, pgp_manager, removed_env_vars)
+            secret.seal_marker(plaintext, pgp_manager)
         })?;
         let rendered = Zeroizing::new(rendered);
         let write_result = FileStorage::write_atomic(
@@ -442,42 +482,6 @@ impl SealedFileManager {
                     "Sealed file '{}' is not configured in the selected profile",
                     configured_file
                 )
-            },
-        }
-    }
-
-    fn encrypt_marker(
-        secret: &SealedSecretWrapper,
-        plaintext: &str,
-        pgp_manager: &PgpManager,
-        removed_env_vars: &[String],
-    ) -> Result<String> {
-        let (algorithm, allocation) = Self::secret_allocation(secret);
-        let secret_value = Zeroizing::new(
-            allocation
-                .resolve(removed_env_vars)
-                .context("Failed to load encryption secret for sealed file")?,
-        );
-        let ciphertext = match algorithm {
-            | SealedAlgorithm::Pgp => {
-                pgp_manager
-                    .encrypt(secret_value.as_str(), plaintext)
-                    .context("Failed to encrypt sealed value with PGP")?
-            },
-            | SealedAlgorithm::Argon2idXchacha20Poly1305 => PasswordCipher::encrypt(secret_value.as_str(), plaintext)?,
-        };
-        Ok(format!(
-            "{}{}]",
-            algorithm.marker_prefix(),
-            base64::engine::general_purpose::STANDARD.encode(ciphertext)
-        ))
-    }
-
-    fn secret_allocation(secret: &SealedSecretWrapper) -> (SealedAlgorithm, &SecretAllocation) {
-        match &secret.inner {
-            | SealedSecret::Pgp(allocation) => (SealedAlgorithm::Pgp, &allocation.inner),
-            | SealedSecret::Argon2idXchacha20Poly1305(allocation) => {
-                (SealedAlgorithm::Argon2idXchacha20Poly1305, &allocation.inner)
             },
         }
     }
@@ -834,17 +838,9 @@ impl Drop for SensitiveValue {
 }
 
 impl SealedDocument {
-    fn decrypt(
-        document: &str,
-        algorithm: SealedAlgorithm,
-        secret: &str,
-        pgp_manager: &mut PgpManager,
-    ) -> Result<String> {
-        Self::decrypt_with(document, algorithm, |_marker_algorithm, ciphertext| {
-            match algorithm {
-                | SealedAlgorithm::Pgp => pgp_manager.decrypt_bytes(secret, ciphertext),
-                | SealedAlgorithm::Argon2idXchacha20Poly1305 => PasswordCipher::decrypt(secret, ciphertext),
-            }
+    fn decrypt(document: &str, secret: &ResolvedSealedSecret, pgp_manager: &mut PgpManager) -> Result<String> {
+        Self::decrypt_with(document, secret.algorithm, |_marker_algorithm, ciphertext| {
+            secret.decrypt_payload(ciphertext, pgp_manager)
         })
     }
 
@@ -956,18 +952,10 @@ impl SealedDocument {
     {
         match value {
             | Value::String(string) => {
-                if let Some((algorithm, ciphertext)) =
-                    Self::decode_marker(string).with_context(|| format!("Invalid sealed value at {}", path))?
+                if let Some(ciphertext) = Self::decode_marker_for(string, expected_algorithm)
+                    .with_context(|| format!("Invalid sealed value at {}", path))?
                 {
-                    if algorithm != expected_algorithm {
-                        anyhow::bail!(
-                            "Sealed value at {} uses {}, but the file is configured for {}",
-                            path,
-                            algorithm.name(),
-                            expected_algorithm.name()
-                        );
-                    }
-                    *string = decrypt(algorithm, &ciphertext)
+                    *string = decrypt(expected_algorithm, &ciphertext)
                         .with_context(|| format!("Failed to decrypt sealed value at {}", path))?;
                     *decrypted_count += 1;
                 }
@@ -1022,6 +1010,20 @@ impl SealedDocument {
             .decode(encoded)
             .context("Encrypted payload is not valid base64")?;
         Ok(Some((algorithm, ciphertext)))
+    }
+
+    fn decode_marker_for(value: &str, expected_algorithm: SealedAlgorithm) -> Result<Option<Vec<u8>>> {
+        let Some((algorithm, ciphertext)) = Self::decode_marker(value)? else {
+            return Ok(None);
+        };
+        if algorithm != expected_algorithm {
+            anyhow::bail!(
+                "Sealed marker uses {}, but its secret is configured for {}",
+                algorithm.name(),
+                expected_algorithm.name()
+            );
+        }
+        Ok(Some(ciphertext))
     }
 
     fn zeroize_value(value: &mut Value) {
@@ -1138,7 +1140,14 @@ impl FileStorage {
 mod tests {
     use {
         super::*,
-        crate::manifest::SecretAllocationWrapper,
+        crate::manifest::{
+            SecretAllocation,
+            SecretAllocationWrapper,
+        },
+        sequoia_openpgp::{
+            cert::prelude::CertBuilder,
+            serialize::SerializeInto,
+        },
         std::fs,
     };
 
@@ -1267,18 +1276,47 @@ mod tests {
         })
         .to_string();
         let mut pgp_manager = PgpManager::default();
+        let secret = ResolvedSealedSecret {
+            algorithm: SealedAlgorithm::Argon2idXchacha20Poly1305,
+            value: Zeroizing::new(passphrase.to_string()),
+        };
 
-        let rendered = SealedDocument::decrypt(
-            &document,
-            SealedAlgorithm::Argon2idXchacha20Poly1305,
-            passphrase,
-            &mut pgp_manager,
-        )?;
+        let rendered = SealedDocument::decrypt(&document, &secret, &mut pgp_manager)?;
         let value: Value = serde_json::from_str(&rendered)?;
         assert_eq!(value["token"], "password-encrypted");
 
-        let mismatch = SealedDocument::decrypt(&document, SealedAlgorithm::Pgp, "not-a-pgp-key", &mut pgp_manager);
+        let pgp_secret = ResolvedSealedSecret {
+            algorithm: SealedAlgorithm::Pgp,
+            value: Zeroizing::new("not-a-pgp-key".to_string()),
+        };
+        let mismatch = SealedDocument::decrypt(&document, &pgp_secret, &mut pgp_manager);
         assert!(format!("{:#}", mismatch.unwrap_err()).contains("configured for PGP"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_secret_round_trips_pgp_markers() -> Result<()> {
+        let (cert, _) = CertBuilder::new()
+            .add_userid("secenv marker test")
+            .add_storage_encryption_subkey()
+            .generate()?;
+        let public_cert = String::from_utf8(cert.armored().to_vec()?)?;
+        let private_key = String::from_utf8(cert.as_tsk().armored().to_vec()?)?;
+        let encrypting_secret = ResolvedSealedSecret {
+            algorithm: SealedAlgorithm::Pgp,
+            value: Zeroizing::new(public_cert),
+        };
+        let decrypting_secret = ResolvedSealedSecret {
+            algorithm: SealedAlgorithm::Pgp,
+            value: Zeroizing::new(private_key),
+        };
+        let mut pgp_manager = PgpManager::default();
+
+        let marker = encrypting_secret.seal_marker("profile-value", &pgp_manager)?;
+        assert_eq!(
+            decrypting_secret.open_marker(&marker, &mut pgp_manager)?,
+            "profile-value"
+        );
         Ok(())
     }
 
@@ -1589,7 +1627,12 @@ mod tests {
         let algorithms: Vec<_> = prepared
             .in_place
             .iter()
-            .map(|file| SealedFileManager::secret_allocation(&file.secret).0)
+            .map(|file| {
+                match file.secret.inner {
+                    | SealedSecret::Pgp(_) => SealedAlgorithm::Pgp,
+                    | SealedSecret::Argon2idXchacha20Poly1305(_) => SealedAlgorithm::Argon2idXchacha20Poly1305,
+                }
+            })
             .collect();
 
         assert!(algorithms.contains(&SealedAlgorithm::Pgp));

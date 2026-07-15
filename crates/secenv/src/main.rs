@@ -16,6 +16,7 @@ use {
     },
     args::{
         ManualFormat,
+        SealTarget,
         UnlockAction,
     },
     manifest::Manifest,
@@ -97,7 +98,7 @@ async fn main() -> Result<ExitCode> {
                     Zeroizing::new(
                         content
                             .inner
-                            .resolve(&mut pgp_manager, &secret_source_env_vars)
+                            .resolve_temporary_file(&mut pgp_manager, &secret_source_env_vars)
                             .with_context(|| format!("Failed to resolve temporary file '{}'", file_path))?,
                     ),
                 ));
@@ -200,7 +201,7 @@ async fn main() -> Result<ExitCode> {
         | crate::args::Command::Seal {
             manifest,
             profile_name,
-            configured_file,
+            target,
             input,
         } => {
             manifest.warn_if_insecure_permissions();
@@ -208,36 +209,58 @@ async fn main() -> Result<ExitCode> {
                 .profiles
                 .get(&profile_name)
                 .with_context(|| format!("Profile '{}' not found in manifest", profile_name))?;
-            let sealed = profile
-                .sealed
-                .as_ref()
-                .with_context(|| format!("Profile '{}' has no sealed files", profile_name))?;
-            let manager = crate::sealed::SealedFileManager::new(manifest.source_directory()?)?;
             let pgp_manager = crate::pgp::PgpManager::default();
             let mut secret_source_env_vars: Vec<_> =
                 profile.secret_environment_variables().map(str::to_owned).collect();
             secret_source_env_vars.sort_unstable();
             secret_source_env_vars.dedup();
 
+            let seal_value = |plaintext: &str| -> Result<String> {
+                match &target {
+                    | SealTarget::Document(configured_file) => {
+                        let sealed = profile
+                            .sealed
+                            .as_ref()
+                            .with_context(|| format!("Profile '{}' has no sealed files", profile_name))?;
+                        crate::sealed::SealedFileManager::new(manifest.source_directory()?)?.seal_value(
+                            sealed,
+                            configured_file,
+                            plaintext,
+                            &pgp_manager,
+                            &secret_source_env_vars,
+                        )
+                    },
+                    | SealTarget::EnvironmentVariable(name) => {
+                        profile
+                            .env
+                            .vars
+                            .get(name)
+                            .with_context(|| {
+                                format!(
+                                    "Environment variable '{}' is not configured in profile '{}'",
+                                    name, profile_name
+                                )
+                            })?
+                            .inner
+                            .seal(plaintext, &pgp_manager, &secret_source_env_vars)
+                            .with_context(|| format!("Failed to seal environment variable '{}'", name))
+                    },
+                }
+            };
+
             let marker = match input {
                 | crate::args::SealInput::Pointer(pointer) => {
-                    manager.seal_path(
-                        sealed,
-                        &configured_file,
-                        &pointer,
-                        &pgp_manager,
-                        &secret_source_env_vars,
-                    )?
+                    let SealTarget::Document(configured_file) = &target else {
+                        anyhow::bail!("--path requires a document target selected with --for");
+                    };
+                    let sealed = profile
+                        .sealed
+                        .as_ref()
+                        .with_context(|| format!("Profile '{}' has no sealed files", profile_name))?;
+                    let manager = crate::sealed::SealedFileManager::new(manifest.source_directory()?)?;
+                    manager.seal_path(sealed, configured_file, &pointer, &pgp_manager, &secret_source_env_vars)?
                 },
-                | crate::args::SealInput::Direct(plaintext) => {
-                    manager.seal_value(
-                        sealed,
-                        &configured_file,
-                        plaintext.as_str(),
-                        &pgp_manager,
-                        &secret_source_env_vars,
-                    )?
-                },
+                | crate::args::SealInput::Direct(plaintext) => seal_value(plaintext.as_str())?,
                 | crate::args::SealInput::Stdin => {
                     use std::io::{
                         IsTerminal,
@@ -251,13 +274,7 @@ async fn main() -> Result<ExitCode> {
                     std::io::stdin()
                         .read_to_string(&mut plaintext)
                         .context("Failed to read plaintext from stdin")?;
-                    manager.seal_value(
-                        sealed,
-                        &configured_file,
-                        plaintext.as_str(),
-                        &pgp_manager,
-                        &secret_source_env_vars,
-                    )?
+                    seal_value(plaintext.as_str())?
                 },
             };
             writeln!(std::io::stdout().lock(), "{}", marker).context("Failed to write sealed marker")?;

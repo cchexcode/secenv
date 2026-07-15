@@ -24,6 +24,11 @@ pub(crate) enum SealInput {
     Stdin,
 }
 
+pub(crate) enum SealTarget {
+    Document(String),
+    EnvironmentVariable(String),
+}
+
 pub(crate) struct ChildCommand {
     program: String,
     arguments: Vec<String>,
@@ -70,7 +75,7 @@ pub(crate) enum Command {
     Seal {
         manifest: Manifest,
         profile_name: String,
-        configured_file: String,
+        target: SealTarget,
         input: SealInput,
     },
     Init {
@@ -167,7 +172,7 @@ impl ClapArgumentLoader {
             )
             .subcommand(
                 clap::Command::new("seal")
-                    .about("Encrypts a value for a configured sealed HOCON or JSON file.")
+                    .about("Encrypts a value for a configured sealed document or profile environment variable.")
                     .arg(
                         clap::Arg::new("config")
                             .short('c')
@@ -186,14 +191,21 @@ impl ClapArgumentLoader {
                         clap::Arg::new("configured_file")
                             .long("for")
                             .value_name("CONFIGURED_PATH")
-                            .required(true)
                             .help("Configured in-place path or template output path"),
+                    )
+                    .arg(
+                        clap::Arg::new("environment_variable")
+                            .long("env-var")
+                            .value_name("NAME")
+                            .help("Profile environment variable configured with sealed content"),
                     )
                     .arg(
                         clap::Arg::new("path")
                             .long("path")
                             .value_name("JSON_POINTER")
                             .required(false)
+                            .requires("configured_file")
+                            .conflicts_with("environment_variable")
                             .help("RFC 6901 JSON Pointer to replace in the configured source document"),
                     )
                     .arg(
@@ -201,6 +213,12 @@ impl ClapArgumentLoader {
                             .value_name("VALUE")
                             .conflicts_with("path")
                             .help("Plaintext value to seal; reads piped stdin when omitted"),
+                    )
+                    .group(
+                        clap::ArgGroup::new("seal_target")
+                            .args(["configured_file", "environment_variable"])
+                            .required(true)
+                            .multiple(false),
                     ),
             )
             .subcommand(
@@ -281,9 +299,14 @@ impl ClapArgumentLoader {
             }
         } else if command.subcommand_name() == Some("seal") {
             let (_, mut subc) = command.remove_subcommand().context("Missing seal arguments")?;
-            let configured_file = subc
-                .remove_one::<String>("configured_file")
-                .context("Missing --for path")?;
+            let target = match (
+                subc.remove_one::<String>("configured_file"),
+                subc.remove_one::<String>("environment_variable"),
+            ) {
+                | (Some(path), None) => SealTarget::Document(path),
+                | (None, Some(name)) => SealTarget::EnvironmentVariable(name),
+                | _ => anyhow::bail!("Exactly one of --for or --env-var is required"),
+            };
             let input = match (subc.remove_one::<String>("path"), subc.remove_one::<String>("value")) {
                 | (Some(pointer), None) => SealInput::Pointer(pointer),
                 | (None, Some(value)) => SealInput::Direct(Zeroizing::new(value)),
@@ -304,7 +327,7 @@ impl ClapArgumentLoader {
             Command::Seal {
                 manifest: cfg,
                 profile_name,
-                configured_file,
+                target,
                 input,
             }
         } else if let Some(subc) = command.subcommand_matches("init") {
@@ -339,6 +362,20 @@ mod tests {
     }
 
     #[test]
+    fn seal_accepts_a_profile_environment_variable_target() {
+        let matches = ClapArgumentLoader::root_command()
+            .try_get_matches_from(["secenv", "seal", "--env-var", "DATABASE_PASSWORD", "password"])
+            .unwrap();
+        let seal = matches.subcommand_matches("seal").unwrap();
+
+        assert_eq!(
+            seal.get_one::<String>("environment_variable").unwrap(),
+            "DATABASE_PASSWORD"
+        );
+        assert_eq!(seal.get_one::<String>("value").unwrap(), "password");
+    }
+
+    #[test]
     fn seal_value_conflicts_with_path_and_file_is_no_longer_accepted() {
         assert!(ClapArgumentLoader::root_command()
             .try_get_matches_from([
@@ -353,6 +390,26 @@ mod tests {
             .is_err());
         assert!(ClapArgumentLoader::root_command()
             .try_get_matches_from(["secenv", "seal", "--file", "./application.conf"])
+            .is_err());
+        assert!(ClapArgumentLoader::root_command()
+            .try_get_matches_from([
+                "secenv",
+                "seal",
+                "--for",
+                "./application.conf",
+                "--env-var",
+                "DATABASE_PASSWORD",
+            ])
+            .is_err());
+        assert!(ClapArgumentLoader::root_command()
+            .try_get_matches_from([
+                "secenv",
+                "seal",
+                "--env-var",
+                "DATABASE_PASSWORD",
+                "--path",
+                "/password",
+            ])
             .is_err());
     }
 

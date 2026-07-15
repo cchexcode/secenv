@@ -12,6 +12,7 @@ use {
             GpgKeySpec,
             GpgManager,
         },
+        sealed::ResolvedSealedSecret,
     },
     anyhow::{
         Context,
@@ -241,6 +242,7 @@ impl Manifest {
             .with_context(|| format!("Failed to deserialize HOCON config: {}", source_path.display()))?;
         manifest.source_path = source_path;
         manifest.validate_version()?;
+        manifest.validate_profiles()?;
         Ok(manifest)
     }
 
@@ -278,6 +280,15 @@ impl Manifest {
             ));
         }
 
+        Ok(())
+    }
+
+    fn validate_profiles(&self) -> Result<()> {
+        for (profile_name, profile) in &self.profiles {
+            profile
+                .validate()
+                .with_context(|| format!("Invalid profile '{}'", profile_name))?;
+        }
         Ok(())
     }
 
@@ -437,6 +448,19 @@ pub(crate) struct ManifestProfile {
 }
 
 impl ManifestProfile {
+    fn validate(&self) -> Result<()> {
+        for (path, content) in &self.files {
+            if matches!(&content.inner, Content::Sealed { .. }) {
+                anyhow::bail!(
+                    "Temporary file '{}' uses sealed inline content, which is supported only in profile environment \
+                     variables",
+                    path
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn secret_environment_variables(&self) -> impl Iterator<Item=&str> {
         self.sealed
             .iter()
@@ -613,6 +637,11 @@ pub(crate) enum Content {
         value: EncodedValueWrapper,
     },
 
+    Sealed {
+        secret: SealedSecretWrapper,
+        value: String,
+    },
+
     /// Load content directly from a local file
     File(String),
 
@@ -637,6 +666,7 @@ impl fmt::Debug for Content {
         match self {
             | Content::Plain(_) => f.write_str("Plain(<redacted>)"),
             | Content::Secure { secret, .. } => write!(f, "Secure({:?})", secret),
+            | Content::Sealed { secret, .. } => write!(f, "Sealed({:?})", secret),
             | Content::File(path) => write!(f, "File({})", path),
             | Content::Gcs { secret, .. } => write!(f, "Gcs({})", secret),
             | Content::Aws { secret, .. } => write!(f, "Aws({})", secret),
@@ -674,6 +704,9 @@ impl Content {
                     },
                 }
             },
+            | Content::Sealed { secret, value } => {
+                ResolvedSealedSecret::load(secret, removed_env_vars)?.open_marker(value, pgp_manager)
+            },
             | Content::File(file_path) => {
                 std::fs::read_to_string(file_path).context(format!("Failed to read file: {}", file_path))
             },
@@ -702,6 +735,29 @@ impl Content {
             },
         }
     }
+
+    pub(crate) fn seal(
+        &self,
+        plaintext: &str,
+        pgp_manager: &crate::pgp::PgpManager,
+        removed_env_vars: &[String],
+    ) -> Result<String> {
+        let Self::Sealed { secret, .. } = self else {
+            anyhow::bail!("Environment variable is not configured as a sealed value");
+        };
+        ResolvedSealedSecret::load(secret, removed_env_vars)?.seal_marker(plaintext, pgp_manager)
+    }
+
+    pub(crate) fn resolve_temporary_file(
+        &self,
+        pgp_manager: &mut crate::pgp::PgpManager,
+        removed_env_vars: &[String],
+    ) -> Result<String> {
+        if matches!(self, Self::Sealed { .. }) {
+            anyhow::bail!("Sealed inline content is supported only for profile environment variables");
+        }
+        self.resolve(pgp_manager, removed_env_vars)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -719,6 +775,7 @@ impl ContentWrapper {
                     | Secret::Pgp(allocation) => allocation.inner.environment_variable(),
                 }
             },
+            | Content::Sealed { secret, .. } => secret.environment_variable(),
             | Content::Plain(_) | Content::File(_) | Content::Gcs { .. } | Content::Aws { .. } => None,
         }
     }
@@ -739,6 +796,116 @@ mod tests {
 
         let profile = manifest.profiles.get("default").context("Missing default profile")?;
         assert!(profile.sealed.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_inline_sealed_profile_environment_values() -> Result<()> {
+        let manifest: Manifest = hocon::de::from_str(
+            r#"
+            version = "0.0.0"
+            profiles.default.env.vars {
+              API_TOKEN.sealed {
+                secret.pgp.gcp.secret = "projects/example/secrets/pgp-key"
+                value = "ENC[PGP,Y2lwaGVydGV4dA==]"
+              }
+              DATABASE_PASSWORD.sealed {
+                secret.argon2id_xchacha20_poly1305.env = "SECENV_DATABASE_PASSPHRASE"
+                value = "ENC[ARGON2ID-XCHACHA20-POLY1305,Y2lwaGVydGV4dA==]"
+              }
+            }
+            "#,
+        )?;
+
+        let vars = &manifest.profiles["default"].env.vars;
+        assert!(matches!(vars["API_TOKEN"].inner, Content::Sealed {
+            secret: SealedSecretWrapper {
+                inner: SealedSecret::Pgp(_),
+            },
+            ..
+        }));
+        assert!(matches!(
+            &vars["DATABASE_PASSWORD"].inner,
+            Content::Sealed {
+                secret: SealedSecretWrapper {
+                    inner: SealedSecret::Argon2idXchacha20Poly1305(_),
+                },
+                value,
+            } if value.starts_with("ENC[ARGON2ID-XCHACHA20-POLY1305,")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn seals_and_opens_inline_profile_environment_values() -> Result<()> {
+        let secret = SealedSecretWrapper {
+            inner: SealedSecret::Argon2idXchacha20Poly1305(SecretAllocationWrapper {
+                inner: SecretAllocation::Literal(EncodedValue::Literal("high-entropy-passphrase".to_string())),
+            }),
+        };
+        let placeholder = Content::Sealed {
+            secret: secret.clone(),
+            value: String::new(),
+        };
+        let pgp_manager = crate::pgp::PgpManager::default();
+        let marker = placeholder.seal("database-password", &pgp_manager, &[])?;
+        let content = Content::Sealed {
+            secret: secret.clone(),
+            value: marker,
+        };
+        let mut pgp_manager = crate::pgp::PgpManager::default();
+        assert_eq!(content.resolve(&mut pgp_manager, &[])?, "database-password");
+
+        let unmarked = Content::Sealed {
+            secret: secret.clone(),
+            value: "database-password".to_string(),
+        };
+        assert!(unmarked.resolve(&mut pgp_manager, &[]).is_err());
+
+        let mismatched = Content::Sealed {
+            secret,
+            value: "ENC[PGP,Y2lwaGVydGV4dA==]".to_string(),
+        };
+        assert!(format!("{:#}", mismatched.resolve(&mut pgp_manager, &[]).unwrap_err())
+            .contains("configured for ARGON2ID-XCHACHA20-POLY1305"));
+        assert!(mismatched
+            .resolve_temporary_file(&mut pgp_manager, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("only for profile environment variables"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_inline_sealed_temporary_files_during_manifest_validation() -> Result<()> {
+        let manifest: Manifest = hocon::de::from_str(
+            r#"
+            version = "0.0.0"
+            profiles = {
+              default = {
+                files = {
+                  temporary = {
+                    sealed = {
+                      secret = {
+                        argon2id_xchacha20_poly1305 = {
+                          env = "SHOULD_NOT_BE_READ"
+                        }
+                      }
+                      value = "ENC[ARGON2ID-XCHACHA20-POLY1305,Y2lwaGVydGV4dA==]"
+                    }
+                  }
+                }
+              }
+            }
+            "#,
+        )?;
+
+        let error = manifest.validate_profiles().unwrap_err();
+        let message = format!("{:#}", error);
+        assert!(
+            message.contains("supported only in profile environment variables"),
+            "{message}"
+        );
         Ok(())
     }
 
@@ -857,6 +1024,10 @@ mod tests {
                 secret.pgp.env = "SECENV_ENV_KEY"
                 value.literal = "encrypted"
               }
+              env.vars.PASSWORD.sealed {
+                secret.argon2id_xchacha20_poly1305.env = "SECENV_PASSWORD_KEY"
+                value = "ENC[ARGON2ID-XCHACHA20-POLY1305,Y2lwaGVydGV4dA==]"
+              }
             }
             "#,
         )?;
@@ -868,6 +1039,7 @@ mod tests {
         assert_eq!(variables, vec![
             "SECENV_ENV_KEY",
             "SECENV_FILE_KEY",
+            "SECENV_PASSWORD_KEY",
             "SECENV_SEALED_KEY"
         ]);
         Ok(())

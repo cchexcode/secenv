@@ -95,6 +95,12 @@ profiles.default {
         -----END PGP MESSAGE-----
         """
       }
+
+      # Sealed marker using the same algorithms and key sources as sealed files
+      DATABASE_PASSWORD.sealed {
+        secret.argon2id_xchacha20_poly1305.gcp.secret = "projects/123456789/secrets/database-passphrase"
+        value = "ENC[ARGON2ID-XCHACHA20-POLY1305,<base64-versioned-payload>]"
+      }
     }
   }
 }
@@ -106,7 +112,7 @@ Notes:
 - Use `secenv init` to generate a JSON example file, or write your own in HOCON format.
 - The `version` field is validated against the CLI version. The config cannot be newer than the CLI, and major versions must match.
 - PGP private keys for ordinary secure variables and temporary files support `literal`, `file`, `env`, `gpg`, `gcp`, and `aws` sources under `secret.pgp`.
-- Sealed-file PGP keys and Argon2id passphrases support the same `literal`, `file`, `env`, `gpg`, `gcp`, and `aws` source forms under the selected algorithm.
+- Sealed-file and inline profile-value PGP keys and Argon2id passphrases support the same `literal`, `file`, `env`, `gpg`, `gcp`, and `aws` source forms under the selected algorithm.
 
 ### 2) Unlock variables and manage temporary files
 
@@ -160,7 +166,7 @@ The temporary files feature allows you to create files with sensitive content th
 ### How it works
 
 1. **Definition**: Files are defined in the `profiles.<profile>.files` section of the config
-2. **Content types**: Files can contain plain text or PGP-encrypted content (same as environment variables)
+2. **Content types**: Files can contain plain text or legacy PGP-encrypted `secure` content; inline `sealed` markers are reserved for profile environment variables
 3. **Creation**: Before running a command (or printing env vars), all files are created with their decrypted content
 4. **Directory creation**: Parent directories are automatically created if they don't exist
 5. **Conflict handling**: If a file already exists, the operation fails unless `--force` is used
@@ -198,7 +204,40 @@ secenv unlock --profile production -- kubectl get pods
 # The kubeconfig and service account files are created, kubectl runs, then files are deleted
 ```
 
-## Sealed HOCON and JSON values
+## Sealed values
+
+The `ENC[...]` marker format works both inside managed HOCON/JSON documents and directly in `profiles.<profile>.env.vars`.
+
+### Inline profile environment values
+
+Use `sealed` for profile variables that should store only ciphertext in `secenv.conf`:
+
+```hocon
+profiles.production.env.vars {
+  API_TOKEN.sealed {
+    secret.pgp.gcp.secret = "projects/myproject/secrets/profile-pgp-key"
+    value = "ENC[PGP,<base64-encoded OpenPGP message>]"
+  }
+
+  DATABASE_PASSWORD.sealed {
+    secret.argon2id_xchacha20_poly1305.aws.secret = "my-app/profile-passphrase"
+    value = "ENC[ARGON2ID-XCHACHA20-POLY1305,<base64-versioned-payload>]"
+  }
+}
+```
+
+During `unlock`, each complete marker is decrypted and the plaintext becomes the variable's value. The configured algorithm must match the marker. Legacy `KEY.secure` values remain supported for raw PGP messages; use `KEY.sealed` for the shared marker format and Argon2id support.
+
+Generate a marker for a configured profile variable and write it to stdout:
+
+```bash
+printf %s 'database-password' \
+  | secenv seal --profile production --env-var DATABASE_PASSWORD
+```
+
+Paste the emitted marker into the variable's `value` field. Secenv does not rewrite `secenv.conf`, because round-tripping HOCON would discard comments, formatting, helper sections, and substitutions.
+
+### Sealed HOCON and JSON documents
 
 Profiles can decrypt individual string values inside existing HOCON or JSON documents. Each file or template selects PGP or Argon2id/XChaCha20-Poly1305 and loads its own key material from a literal, file, environment variable, GPG keyring, GCP Secret Manager, or AWS Secrets Manager. All required secrets are loaded and every document is decrypted and authenticated in zeroized in-memory buffers before any plaintext document is written.
 
@@ -261,7 +300,7 @@ profiles.production.sealed {
 
 ### Generating sealed values
 
-`secenv seal` selects a configured in-place path or template output path and uses that entry's configured algorithm. PGP entries encrypt with the public portion of the configured certificate. Argon2id/XChaCha20-Poly1305 entries derive an encryption key from the configured passphrase.
+`secenv seal` selects a configured in-place path, template output path, or profile environment variable and uses that entry's configured algorithm. PGP entries encrypt with the public portion of the configured certificate. Argon2id/XChaCha20-Poly1305 entries derive an encryption key from the configured passphrase.
 
 For an `env` source, the configured value is the environment variable name, not the secret itself. PGP sealing needs a public certificate and unlocking needs the corresponding private key; an environment variable containing the private certificate can serve both operations. Password values and multiline PGP key material are read verbatim without trimming. Missing or non-Unicode variables are rejected before plaintext files are written.
 
@@ -334,10 +373,10 @@ HOCON resolves `password_copy` to `"plaintext"` before secenv traverses the docu
 Behavior and constraints:
 
 - A marker must occupy the complete string value. Decrypted values are emitted as strings.
-- A marker's algorithm must match its file's configured secret type; mixed algorithms within one file are rejected.
+- A marker's algorithm must match its file or profile variable's configured secret type; mixed algorithms within one file are rejected.
 - `argon2id_xchacha20_poly1305` uses Argon2id with 19 MiB memory, 2 iterations, and 1 lane to derive a 256-bit key. Its versioned payload contains a random 16-byte salt, random 24-byte nonce, and authenticated XChaCha20-Poly1305 ciphertext. Use a high-entropy passphrase.
 - Environment variables used as any secret source are removed from provider helper processes and child commands run by `secenv unlock`. Defining the same name explicitly in `profiles.<profile>.env.vars` reintroduces it only for the final child. The original value remains in secenv's parent process environment.
-- Unmarked strings and all numbers, booleans, arrays, objects, and null values are preserved.
+- Inside managed HOCON/JSON documents, unmarked strings and all numbers, booleans, arrays, objects, and null values are preserved. A profile variable configured with `sealed` must contain one complete marker.
 - Documents are parsed strictly as HOCON and materialized as canonical JSON, which is valid HOCON. System-environment substitutions such as `${HOME}` are disabled; normal substitutions within the document still resolve.
 - In-place source bytes, formatting, comments, and basic file permissions are restored after execution. Atomic replacement creates a new inode, so original ownership, hard-link identity, ACLs, extended attributes, and timestamps are not guaranteed to be preserved.
 - In-place files and template sources must already exist and must be regular files inside the current project directory. Symbolic links, hard-linked files on Unix, and paths outside the project are rejected.
@@ -373,7 +412,7 @@ profiles = {
     files = { ... }              # optional
     env = { 
       keep = [<regex>],          # optional
-      vars = { ... }             # required
+      vars = { ... }             # optional
     } 
   } 
 }
@@ -407,7 +446,7 @@ profiles.<profile>.files {
 
 ```hocon
 profiles.<profile>.env.keep = ["^PATH$", "^LC_.*"]  # optional
-profiles.<profile>.env.vars {                          # required
+profiles.<profile>.env.vars {                          # optional
   # Plain values (inline only)
   KEY.plain.literal = "value"
   KEY.plain.base64  = "<base64-encoded string>"
@@ -442,6 +481,12 @@ profiles.<profile>.env.vars {                          # required
     # or
     # value.base64 = "<base64-encoded-ASCII-armored-message>"
   }
+
+  # Shared sealed-marker format: PGP or Argon2id, with any supported secret source
+  DATABASE_PASSWORD.sealed {
+    secret.argon2id_xchacha20_poly1305.gcp.secret = "projects/<project>/secrets/<passphrase>"
+    value = "ENC[ARGON2ID-XCHACHA20-POLY1305,<base64-versioned-payload>]"
+  }
 }
 ```
 
@@ -449,9 +494,10 @@ profiles.<profile>.env.vars {                          # required
 
 - **plain**: Inline string value via `literal` or `base64`
 - **secure**: Decrypts a PGP message using a provided PGP private key (`secret.pgp.*`)
+- **sealed**: Decrypts a complete PGP or Argon2id `ENC[...]` marker using any supported secret source
 
 Important:
-- Reading plain values from files or environment variables is not supported in the new manifest. Provide plain values inline via `literal`/`base64`.
+- Direct profile values can be loaded from `file`, `gcs`, or `aws`; inline plain values use `literal` or `base64`.
 - Decryption via GPG keyring requires a `fingerprint`, and secenv verifies that GPG used that key.
 
 ## CLI reference
@@ -485,20 +531,22 @@ Behavior:
 - Sealed in-place files and template outputs exist in decrypted form only while `unlock` is active and are restored or removed before it exits.
 
 ### seal
-Encrypt a value using the PGP key or Argon2id passphrase configured for one sealed file.
+Encrypt a value using the PGP key or Argon2id passphrase configured for a sealed document or profile environment variable.
 
 ```bash
 secenv seal --for <configured-path> [VALUE] [OPTIONS]
 secenv seal --for <configured-path> --path <json-pointer> [OPTIONS]
+secenv seal --env-var <name> [VALUE] [OPTIONS]
 
 Options:
   -c, --config <path>     Path to config (default: secenv.conf)
   -p, --profile <name>    Profile name (default: default)
       --for <path>        Configured in-place path or template output path
+      --env-var <name>    Profile environment variable configured with sealed content
       --path <json-pointer> RFC 6901 pointer to one string in the configured source document
 ```
 
-Without `--path`, plaintext comes from positional `VALUE`, or exactly from piped stdin when `VALUE` is omitted, and the marker is written to stdout. Direct values may be exposed through shell history and process listings. With `--path`, `VALUE` is rejected, the selected source document is updated, and the resulting marker is also written to stdout.
+Exactly one of `--for` or `--env-var` is required. Without `--path`, plaintext comes from positional `VALUE`, or exactly from piped stdin when `VALUE` is omitted, and the marker is written to stdout. Direct values may be exposed through shell history and process listings. With `--path`, `VALUE` is rejected, the selected source document is updated, and the resulting marker is also written to stdout. `--path` is valid only with `--for`; `--env-var` never rewrites the manifest.
 
 ### man
 Render the manual pages or markdown help.
@@ -539,7 +587,7 @@ Notes:
 - "File '<path>' already exists": A temporary file conflicts with an existing file. Use `--force` to replace it temporarily and restore it afterward.
 - GCP access errors: Check `gcloud` authentication, project, permissions, and secret name.
 - PGP decryption errors: Ensure the private key is valid ASCII‑armored and corresponds to the message.
-- Sealed document errors: Ensure each selected file is valid HOCON/JSON and each encrypted string uses `ENC[PGP,<base64>]` or `ENC[ARGON2ID-XCHACHA20-POLY1305,<base64>]` matching the file configuration.
+- Sealed value errors: Ensure each marker uses `ENC[PGP,<base64>]` or `ENC[ARGON2ID-XCHACHA20-POLY1305,<base64>]` and matches its file or profile-variable configuration.
 - File cleanup errors: Cleanup failures are reported as command failures and retried when the file manager is dropped.
 
 ## Testing
