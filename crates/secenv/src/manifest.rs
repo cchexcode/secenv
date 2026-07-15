@@ -83,6 +83,7 @@ impl fmt::Debug for EncodedValueWrapper {
 pub(crate) enum SecretAllocation {
     Literal(EncodedValue),
     File(String),
+    Env(String),
     Gpg {
         fingerprint: String,
     },
@@ -102,6 +103,7 @@ impl fmt::Debug for SecretAllocation {
         match self {
             | SecretAllocation::Literal(_) => f.write_str("Literal(<redacted>)"),
             | SecretAllocation::File(path) => write!(f, "File({})", path),
+            | SecretAllocation::Env(variable) => write!(f, "Env(variable={})", variable),
             | SecretAllocation::Gpg { fingerprint } => write!(f, "Gpg(fingerprint={})", fingerprint),
             | SecretAllocation::Gcp { secret, .. } => write!(f, "Gcp(secret={})", secret),
             | SecretAllocation::Aws { secret, .. } => write!(f, "Aws(secret={})", secret),
@@ -110,16 +112,19 @@ impl fmt::Debug for SecretAllocation {
 }
 
 impl SecretAllocation {
-    pub(crate) fn resolve(&self) -> Result<String> {
+    pub(crate) fn resolve(&self, removed_env_vars: &[String]) -> Result<String> {
         match self {
             | SecretAllocation::Literal(encoded_value) => encoded_value.decode(),
             | SecretAllocation::File(file_path) => {
                 std::fs::read_to_string(file_path).context(format!("Failed to read file: {}", file_path))
             },
+            | SecretAllocation::Env(variable) => {
+                Self::resolve_environment_variable_with(variable, |name| std::env::var(name))
+            },
             | SecretAllocation::Gpg { fingerprint } => {
                 let spec = GpgKeySpec::new(fingerprint.clone())?;
                 GpgManager
-                    .export_private_key(&spec)
+                    .export_private_key(&spec, removed_env_vars)
                     .context("Failed to export GPG private key")
             },
             | SecretAllocation::Gcp { secret, version } => {
@@ -128,7 +133,7 @@ impl SecretAllocation {
                     version: version.clone(),
                 };
                 GcpSecretManager
-                    .access_secret(&spec)
+                    .access_secret(&spec, removed_env_vars)
                     .context("Failed to access GCP secret")
             },
             | SecretAllocation::Aws {
@@ -142,8 +147,31 @@ impl SecretAllocation {
                     region: region.clone(),
                 };
                 AwsSecretManager
-                    .access_secret(&spec)
+                    .access_secret(&spec, removed_env_vars)
                     .context("Failed to access AWS secret")
+            },
+        }
+    }
+
+    pub(crate) fn environment_variable(&self) -> Option<&str> {
+        match self {
+            | Self::Env(variable) => Some(variable),
+            | Self::Literal(_) | Self::File(_) | Self::Gpg { .. } | Self::Gcp { .. } | Self::Aws { .. } => None,
+        }
+    }
+
+    fn resolve_environment_variable_with<F>(variable: &str, lookup: F) -> Result<String>
+    where F: FnOnce(&str) -> std::result::Result<String, std::env::VarError> {
+        if variable.is_empty() || variable.contains('=') || variable.contains('\0') {
+            anyhow::bail!("Invalid environment variable name for secret source");
+        }
+        match lookup(variable) {
+            | Ok(value) => Ok(value),
+            | Err(std::env::VarError::NotPresent) => {
+                anyhow::bail!("Environment variable '{}' is not set", variable)
+            },
+            | Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("Environment variable '{}' is not valid Unicode", variable)
             },
         }
     }
@@ -154,60 +182,6 @@ impl SecretAllocation {
 pub(crate) struct SecretAllocationWrapper {
     #[serde(flatten)]
     pub(crate) inner: SecretAllocation,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RemoteSecretAllocation {
-    Gcp {
-        secret: String,
-        version: Option<String>,
-    },
-    Aws {
-        secret: String,
-        version: Option<String>,
-        region: Option<String>,
-    },
-}
-
-impl fmt::Debug for RemoteSecretAllocation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            | Self::Gcp { secret, .. } => write!(f, "Gcp(secret={})", secret),
-            | Self::Aws { secret, .. } => write!(f, "Aws(secret={})", secret),
-        }
-    }
-}
-
-impl RemoteSecretAllocation {
-    pub(crate) fn resolve(&self) -> Result<String> {
-        match self {
-            | Self::Gcp { secret, version } => {
-                GcpSecretManager.access_secret(&GcpSecretSpec {
-                    secret: secret.clone(),
-                    version: version.clone(),
-                })
-            },
-            | Self::Aws {
-                secret,
-                version,
-                region,
-            } => {
-                AwsSecretManager.access_secret(&AwsSecretSpec {
-                    secret: secret.clone(),
-                    version: version.clone(),
-                    region: region.clone(),
-                })
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) struct RemoteSecretAllocationWrapper {
-    #[serde(flatten)]
-    pub(crate) inner: RemoteSecretAllocation,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -462,6 +436,25 @@ pub(crate) struct ManifestProfile {
     pub(crate) env: ManifestEnv,
 }
 
+impl ManifestProfile {
+    pub(crate) fn secret_environment_variables(&self) -> impl Iterator<Item=&str> {
+        self.sealed
+            .iter()
+            .flat_map(SealedFiles::environment_variables)
+            .chain(
+                self.files
+                    .values()
+                    .filter_map(ContentWrapper::secret_environment_variable),
+            )
+            .chain(
+                self.env
+                    .vars
+                    .values()
+                    .filter_map(ContentWrapper::secret_environment_variable),
+            )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) struct SealedFiles {
@@ -475,11 +468,21 @@ pub(crate) struct SealedFiles {
     pub(crate) templates: HashMap<String, SealedTemplate>,
 }
 
+impl SealedFiles {
+    pub(crate) fn environment_variables(&self) -> impl Iterator<Item=&str> {
+        self.files
+            .values()
+            .map(|file| &file.secret)
+            .chain(self.templates.values().map(|template| &template.secret))
+            .filter_map(SealedSecretWrapper::environment_variable)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SealedSecret {
-    Pgp(RemoteSecretAllocationWrapper),
-    Argon2idXchacha20Poly1305(RemoteSecretAllocationWrapper),
+    Pgp(SecretAllocationWrapper),
+    Argon2idXchacha20Poly1305(SecretAllocationWrapper),
 }
 
 impl fmt::Debug for SealedSecret {
@@ -498,6 +501,16 @@ impl fmt::Debug for SealedSecret {
 pub(crate) struct SealedSecretWrapper {
     #[serde(flatten)]
     pub(crate) inner: SealedSecret,
+}
+
+impl SealedSecretWrapper {
+    fn environment_variable(&self) -> Option<&str> {
+        match &self.inner {
+            | SealedSecret::Pgp(allocation) | SealedSecret::Argon2idXchacha20Poly1305(allocation) => {
+                allocation.inner.environment_variable()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -542,14 +555,14 @@ impl fmt::Debug for FromLocation {
 
 impl FromLocation {
     /// Fetch the raw string content from this source.
-    pub(crate) fn resolve(&self) -> Result<String> {
+    pub(crate) fn resolve(&self, removed_env_vars: &[String]) -> Result<String> {
         match self {
             | FromLocation::Gcs { secret, version } => {
                 let spec = GcpSecretSpec {
                     secret: secret.to_string(),
                     version: version.as_ref().map(|v| v.to_string()),
                 };
-                GcpSecretManager.access_secret(&spec)
+                GcpSecretManager.access_secret(&spec, removed_env_vars)
             },
             | FromLocation::Aws {
                 secret,
@@ -561,7 +574,7 @@ impl FromLocation {
                     version: version.as_ref().map(|v| v.to_string()),
                     region: region.as_ref().map(|r| r.to_string()),
                 };
-                AwsSecretManager.access_secret(&spec)
+                AwsSecretManager.access_secret(&spec, removed_env_vars)
             },
             | FromLocation::File(file_path) => {
                 std::fs::read_to_string(file_path).context(format!("Failed to read env file: {}", file_path))
@@ -632,7 +645,11 @@ impl fmt::Debug for Content {
 }
 
 impl Content {
-    pub(crate) fn resolve(&self, pgp_manager: &mut crate::pgp::PgpManager) -> Result<String> {
+    pub(crate) fn resolve(
+        &self,
+        pgp_manager: &mut crate::pgp::PgpManager,
+        removed_env_vars: &[String],
+    ) -> Result<String> {
         match self {
             | Content::Plain(encoded_value) => encoded_value.decode(),
             | Content::Secure { secret, value } => {
@@ -644,11 +661,11 @@ impl Content {
                             | SecretAllocation::Gpg { fingerprint } => {
                                 let spec = GpgKeySpec::new(fingerprint.clone())?;
                                 GpgManager
-                                    .decrypt_data(&spec, &encrypted_data)
+                                    .decrypt_data(&spec, &encrypted_data, removed_env_vars)
                                     .context("Failed to decrypt value with GPG")
                             },
                             | _ => {
-                                let pgp_key = Zeroizing::new(allocation_wrapper.inner.resolve()?);
+                                let pgp_key = Zeroizing::new(allocation_wrapper.inner.resolve(removed_env_vars)?);
                                 pgp_manager
                                     .decrypt(pgp_key.as_str(), &encrypted_data)
                                     .context("Failed to decrypt value with PGP key")
@@ -666,7 +683,7 @@ impl Content {
                     version: version.clone(),
                 };
                 GcpSecretManager
-                    .access_secret(&spec)
+                    .access_secret(&spec, removed_env_vars)
                     .context("Failed to access GCP secret")
             },
             | Content::Aws {
@@ -680,7 +697,7 @@ impl Content {
                     region: region.clone(),
                 };
                 AwsSecretManager
-                    .access_secret(&spec)
+                    .access_secret(&spec, removed_env_vars)
                     .context("Failed to access AWS secret")
             },
         }
@@ -692,6 +709,19 @@ impl Content {
 pub(crate) struct ContentWrapper {
     #[serde(flatten)]
     pub(crate) inner: Content,
+}
+
+impl ContentWrapper {
+    fn secret_environment_variable(&self) -> Option<&str> {
+        match &self.inner {
+            | Content::Secure { secret, .. } => {
+                match &secret.inner {
+                    | Secret::Pgp(allocation) => allocation.inner.environment_variable(),
+                }
+            },
+            | Content::Plain(_) | Content::File(_) | Content::Gcs { .. } | Content::Aws { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -748,31 +778,179 @@ mod tests {
         assert!(sealed.files.contains_key("./application.conf"));
         assert!(matches!(
             sealed.files["./application.conf"].secret.inner,
-            SealedSecret::Pgp(RemoteSecretAllocationWrapper {
-                inner: RemoteSecretAllocation::Gcp { .. }
+            SealedSecret::Pgp(SecretAllocationWrapper {
+                inner: SecretAllocation::Gcp { .. }
             })
         ));
         assert!(matches!(
             sealed.templates["./credentials.json"].secret.inner,
-            SealedSecret::Argon2idXchacha20Poly1305(RemoteSecretAllocationWrapper {
-                inner: RemoteSecretAllocation::Gcp { .. }
+            SealedSecret::Argon2idXchacha20Poly1305(SecretAllocationWrapper {
+                inner: SecretAllocation::Gcp { .. }
             })
         ));
         Ok(())
     }
 
     #[test]
-    fn rejects_local_sealed_secrets() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("secenv.conf");
-        std::fs::write(
-            &path,
+    fn parses_environment_sealed_secret_sources() -> Result<()> {
+        let manifest: Manifest = hocon::de::from_str(
             r#"
             version = "0.0.0"
-            profiles.default.sealed.files."./application.conf".secret.pgp.file = "private.key"
+            profiles.default.sealed {
+              files {
+                "./application.conf" {
+                  secret.pgp.env = "SECENV_PGP_KEY"
+                }
+              }
+              templates {
+                "./credentials.json" {
+                  source = "./credentials.json.sealed"
+                  secret.argon2id_xchacha20_poly1305.env = "SECENV_PASSWORD"
+                }
+              }
+            }
             "#,
         )?;
-        assert!(Manifest::load(path).is_err());
+
+        let sealed = manifest.profiles["default"]
+            .sealed
+            .as_ref()
+            .context("Missing sealed configuration")?;
+        assert!(matches!(
+            &sealed.files["./application.conf"].secret.inner,
+            SealedSecret::Pgp(SecretAllocationWrapper {
+                inner: SecretAllocation::Env(variable),
+            }) if variable == "SECENV_PGP_KEY"
+        ));
+        assert!(matches!(
+            &sealed.templates["./credentials.json"].secret.inner,
+            SealedSecret::Argon2idXchacha20Poly1305(SecretAllocationWrapper {
+                inner: SecretAllocation::Env(variable),
+            }) if variable == "SECENV_PASSWORD"
+        ));
+        let mut variables = sealed.environment_variables().collect::<Vec<_>>();
+        variables.sort_unstable();
+        assert_eq!(variables, vec!["SECENV_PASSWORD", "SECENV_PGP_KEY"]);
+        Ok(())
+    }
+
+    #[test]
+    fn collects_environment_sources_across_the_profile() -> Result<()> {
+        let manifest: Manifest = hocon::de::from_str(
+            r#"
+            version = "0.0.0"
+            profiles.default {
+              sealed.files {
+                "./application.conf" {
+                  secret.pgp.env = "SECENV_SEALED_KEY"
+                }
+              }
+              files {
+                "./temporary.txt" {
+                  secure {
+                    secret.pgp.env = "SECENV_FILE_KEY"
+                    value.literal = "encrypted"
+                  }
+                }
+              }
+              env.vars.TOKEN.secure {
+                secret.pgp.env = "SECENV_ENV_KEY"
+                value.literal = "encrypted"
+              }
+            }
+            "#,
+        )?;
+
+        let mut variables = manifest.profiles["default"]
+            .secret_environment_variables()
+            .collect::<Vec<_>>();
+        variables.sort_unstable();
+        assert_eq!(variables, vec![
+            "SECENV_ENV_KEY",
+            "SECENV_FILE_KEY",
+            "SECENV_SEALED_KEY"
+        ]);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_environment_sealed_secrets_without_exposing_invalid_values() -> Result<()> {
+        let value =
+            SecretAllocation::resolve_environment_variable_with(
+                "SECENV_PASSWORD",
+                |_| Ok("test-password".to_string()),
+            )?;
+        assert_eq!(value, "test-password");
+
+        let missing = SecretAllocation::resolve_environment_variable_with("SECENV_PASSWORD", |_| {
+            Err(std::env::VarError::NotPresent)
+        })
+        .unwrap_err();
+        assert_eq!(missing.to_string(), "Environment variable 'SECENV_PASSWORD' is not set");
+
+        let invalid = SecretAllocation::resolve_environment_variable_with("SECENV_PASSWORD", |_| {
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from("hidden-value")))
+        })
+        .unwrap_err();
+        assert_eq!(
+            invalid.to_string(),
+            "Environment variable 'SECENV_PASSWORD' is not valid Unicode"
+        );
+        assert!(!invalid.to_string().contains("hidden-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_local_and_aws_sealed_secret_sources() -> Result<()> {
+        let manifest: Manifest = hocon::de::from_str(
+            r#"
+            version = "0.0.0"
+            profiles.default.sealed.files {
+              "./literal.conf" {
+                secret.pgp.literal.literal = "certificate"
+              }
+              "./file.conf" {
+                secret.argon2id_xchacha20_poly1305.file = "password.txt"
+              }
+              "./gpg.conf" {
+                secret.pgp.gpg.fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567"
+              }
+              "./aws.conf" {
+                secret.argon2id_xchacha20_poly1305.aws.secret = "application/password"
+              }
+            }
+            "#,
+        )?;
+
+        let files = &manifest.profiles["default"]
+            .sealed
+            .as_ref()
+            .context("Missing sealed configuration")?
+            .files;
+        assert!(matches!(
+            files["./literal.conf"].secret.inner,
+            SealedSecret::Pgp(SecretAllocationWrapper {
+                inner: SecretAllocation::Literal(EncodedValue::Literal(_)),
+            })
+        ));
+        assert!(matches!(
+            files["./file.conf"].secret.inner,
+            SealedSecret::Argon2idXchacha20Poly1305(SecretAllocationWrapper {
+                inner: SecretAllocation::File(_),
+            })
+        ));
+        assert!(matches!(
+            files["./gpg.conf"].secret.inner,
+            SealedSecret::Pgp(SecretAllocationWrapper {
+                inner: SecretAllocation::Gpg { .. },
+            })
+        ));
+        assert!(matches!(
+            files["./aws.conf"].secret.inner,
+            SealedSecret::Argon2idXchacha20Poly1305(SecretAllocationWrapper {
+                inner: SecretAllocation::Aws { .. },
+            })
+        ));
         Ok(())
     }
 }

@@ -41,7 +41,7 @@ impl AwsSecretSpec {
 pub(crate) struct AwsSecretManager;
 
 impl AwsSecretManager {
-    pub(crate) fn access_secret(&self, spec: &AwsSecretSpec) -> Result<String> {
+    pub(crate) fn access_secret(&self, spec: &AwsSecretSpec, removed_env_vars: &[String]) -> Result<String> {
         let mut cmd = Command::new("aws");
         cmd.args(["secretsmanager", "get-secret-value"])
             .arg("--secret-id")
@@ -56,6 +56,7 @@ impl AwsSecretManager {
         if let Some(region) = &spec.region {
             cmd.arg("--region").arg(region);
         }
+        crate::process::remove_environment_variables(&mut cmd, removed_env_vars);
 
         let mut output = cmd
             .stdin(Stdio::null())

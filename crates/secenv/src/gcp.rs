@@ -75,7 +75,7 @@ impl GcpSecretManager {
         }
     }
 
-    pub(crate) fn access_secret(&self, spec: &GcpSecretSpec) -> Result<String> {
+    pub(crate) fn access_secret(&self, spec: &GcpSecretSpec, removed_env_vars: &[String]) -> Result<String> {
         let (project, secret_name, fqn_version) = spec
             .parse_fqn()
             .context("Invalid GCP secret format. Expected 'projects/<project>/secrets/<name>'")?;
@@ -95,6 +95,7 @@ impl GcpSecretManager {
         .arg(secret_name)
         .arg("--project")
         .arg(project);
+        crate::process::remove_environment_variables(&mut cmd, removed_env_vars);
 
         let mut output = cmd
             .stdin(Stdio::null())

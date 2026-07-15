@@ -6,12 +6,12 @@ use std::os::unix::fs::{
 use {
     crate::{
         manifest::{
-            RemoteSecretAllocation,
             SealedFile,
             SealedFiles,
             SealedSecret,
             SealedSecretWrapper,
             SealedTemplate,
+            SecretAllocation,
         },
         password_cipher::PasswordCipher,
         pgp::PgpManager,
@@ -249,6 +249,7 @@ impl SealedFileManager {
         &self,
         config: &SealedFiles,
         generated_files: &[String],
+        removed_env_vars: &[String],
         pgp_manager: &mut PgpManager,
         force: bool,
         mut cancelled: C,
@@ -260,7 +261,6 @@ impl SealedFileManager {
         if prepared.is_empty() {
             return Ok(());
         }
-
         // Fetch every per-file key before writing any plaintext document.
         let mut loaded_secrets = Vec::with_capacity(prepared.in_place.len() + prepared.templates.len());
         for secret in prepared
@@ -269,13 +269,13 @@ impl SealedFileManager {
             .map(|file| &file.secret)
             .chain(prepared.templates.iter().map(|template| &template.secret))
         {
-            let (algorithm, allocation) = Self::remote_secret_allocation(secret);
+            let (algorithm, allocation) = Self::secret_allocation(secret);
             loaded_secrets.push(LoadedSecret {
                 algorithm,
                 value: Zeroizing::new(
                     allocation
-                        .resolve()
-                        .context("Failed to load remote encryption secret for sealed file")?,
+                        .resolve(removed_env_vars)
+                        .context("Failed to load encryption secret for sealed file")?,
                 ),
             });
         }
@@ -366,11 +366,12 @@ impl SealedFileManager {
         configured_file: &str,
         plaintext: &str,
         pgp_manager: &PgpManager,
+        removed_env_vars: &[String],
     ) -> Result<String> {
         self.prepare(&config.files, &config.templates, &[], true)
             .context("Invalid sealed file configuration")?;
         let selected = Self::select_file(config, configured_file)?;
-        Self::encrypt_marker(selected.secret, plaintext, pgp_manager)
+        Self::encrypt_marker(selected.secret, plaintext, pgp_manager, removed_env_vars)
     }
 
     pub(crate) fn seal_path(
@@ -379,6 +380,7 @@ impl SealedFileManager {
         configured_file: &str,
         json_pointer: &str,
         pgp_manager: &PgpManager,
+        removed_env_vars: &[String],
     ) -> Result<String> {
         self.prepare(&config.files, &config.templates, &[], true)
             .context("Invalid sealed file configuration")?;
@@ -389,7 +391,7 @@ impl SealedFileManager {
         let document = std::str::from_utf8(&contents)
             .with_context(|| format!("Sealed source '{}' is not valid UTF-8", source_path.display()))?;
         let (rendered, marker) = SealedDocument::seal_path_with(document, json_pointer, |plaintext| {
-            Self::encrypt_marker(selected.secret, plaintext, pgp_manager)
+            Self::encrypt_marker(selected.secret, plaintext, pgp_manager, removed_env_vars)
         })?;
         let rendered = Zeroizing::new(rendered);
         let write_result = FileStorage::write_atomic(
@@ -444,12 +446,17 @@ impl SealedFileManager {
         }
     }
 
-    fn encrypt_marker(secret: &SealedSecretWrapper, plaintext: &str, pgp_manager: &PgpManager) -> Result<String> {
-        let (algorithm, allocation) = Self::remote_secret_allocation(secret);
+    fn encrypt_marker(
+        secret: &SealedSecretWrapper,
+        plaintext: &str,
+        pgp_manager: &PgpManager,
+        removed_env_vars: &[String],
+    ) -> Result<String> {
+        let (algorithm, allocation) = Self::secret_allocation(secret);
         let secret_value = Zeroizing::new(
             allocation
-                .resolve()
-                .context("Failed to load remote encryption secret for sealed file")?,
+                .resolve(removed_env_vars)
+                .context("Failed to load encryption secret for sealed file")?,
         );
         let ciphertext = match algorithm {
             | SealedAlgorithm::Pgp => {
@@ -466,7 +473,7 @@ impl SealedFileManager {
         ))
     }
 
-    fn remote_secret_allocation(secret: &SealedSecretWrapper) -> (SealedAlgorithm, &RemoteSecretAllocation) {
+    fn secret_allocation(secret: &SealedSecretWrapper) -> (SealedAlgorithm, &SecretAllocation) {
         match &secret.inner {
             | SealedSecret::Pgp(allocation) => (SealedAlgorithm::Pgp, &allocation.inner),
             | SealedSecret::Argon2idXchacha20Poly1305(allocation) => {
@@ -1131,6 +1138,7 @@ impl FileStorage {
 mod tests {
     use {
         super::*,
+        crate::manifest::SecretAllocationWrapper,
         std::fs,
     };
 
@@ -1163,8 +1171,8 @@ mod tests {
 
     fn remote_secret(name: &str) -> SealedSecretWrapper {
         SealedSecretWrapper {
-            inner: SealedSecret::Pgp(crate::manifest::RemoteSecretAllocationWrapper {
-                inner: RemoteSecretAllocation::Gcp {
+            inner: SealedSecret::Pgp(SecretAllocationWrapper {
+                inner: SecretAllocation::Gcp {
                     secret: format!("projects/example/secrets/{}", name),
                     version: None,
                 },
@@ -1174,8 +1182,8 @@ mod tests {
 
     fn remote_password_secret(name: &str) -> SealedSecretWrapper {
         SealedSecretWrapper {
-            inner: SealedSecret::Argon2idXchacha20Poly1305(crate::manifest::RemoteSecretAllocationWrapper {
-                inner: RemoteSecretAllocation::Gcp {
+            inner: SealedSecret::Argon2idXchacha20Poly1305(SecretAllocationWrapper {
+                inner: SecretAllocation::Gcp {
                     secret: format!("projects/example/secrets/{}", name),
                     version: None,
                 },
@@ -1496,7 +1504,7 @@ mod tests {
         let manager = SealedFileManager::new(directory.path().to_path_buf())?;
         let pgp_manager = PgpManager::default();
         let error = manager
-            .seal_value(&config, &source.display().to_string(), "plaintext", &pgp_manager)
+            .seal_value(&config, &source.display().to_string(), "plaintext", &pgp_manager, &[])
             .unwrap_err();
         assert!(format!("{:#}", error).contains("also configured as an output"));
         Ok(())
@@ -1551,7 +1559,7 @@ mod tests {
             let SealedSecret::Pgp(allocation) = &secret.inner else {
                 panic!("test key is not PGP");
             };
-            let RemoteSecretAllocation::Gcp { secret, .. } = &allocation.inner else {
+            let SecretAllocation::Gcp { secret, .. } = &allocation.inner else {
                 panic!("test key is not a GCP allocation");
             };
             keys.push(secret.clone());
@@ -1581,7 +1589,7 @@ mod tests {
         let algorithms: Vec<_> = prepared
             .in_place
             .iter()
-            .map(|file| SealedFileManager::remote_secret_allocation(&file.secret).0)
+            .map(|file| SealedFileManager::secret_allocation(&file.secret).0)
             .collect();
 
         assert!(algorithms.contains(&SealedAlgorithm::Pgp));

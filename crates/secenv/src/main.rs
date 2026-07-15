@@ -5,6 +5,7 @@ mod gpg;
 mod manifest;
 mod password_cipher;
 mod pgp;
+mod process;
 mod reference;
 mod sealed;
 
@@ -67,16 +68,22 @@ async fn main() -> Result<ExitCode> {
                 .get(profile_name.as_str())
                 .with_context(|| format!("Profile '{}' not found in manifest", profile_name))?;
 
+            let mut secret_source_env_vars: Vec<_> =
+                profile.secret_environment_variables().map(str::to_owned).collect();
+            secret_source_env_vars.sort_unstable();
+            secret_source_env_vars.dedup();
+
             let generated_files: Vec<_> = profile.files.keys().cloned().collect();
             let sealed_file_manager = crate::sealed::SealedFileManager::new(manifest.source_directory()?)?;
             sealed_file_manager.validate_profile(profile.sealed.as_ref(), &generated_files, force)?;
 
-            let mut environment = Environment::load(profile)?;
+            let mut environment = Environment::load(profile, &secret_source_env_vars)?;
+            environment.remove_secret_sources(&secret_source_env_vars);
 
             for (key, value) in profile.env.vars.iter() {
                 let value = value
                     .inner
-                    .resolve(&mut pgp_manager)
+                    .resolve(&mut pgp_manager, &secret_source_env_vars)
                     .with_context(|| format!("Failed to resolve environment variable '{}'", key))?;
                 environment.insert(key.clone(), value)?;
             }
@@ -90,7 +97,7 @@ async fn main() -> Result<ExitCode> {
                     Zeroizing::new(
                         content
                             .inner
-                            .resolve(&mut pgp_manager)
+                            .resolve(&mut pgp_manager, &secret_source_env_vars)
                             .with_context(|| format!("Failed to resolve temporary file '{}'", file_path))?,
                     ),
                 ));
@@ -122,6 +129,7 @@ async fn main() -> Result<ExitCode> {
                         sealed_file_manager.unseal(
                             sealed,
                             &generated_files,
+                            &secret_source_env_vars,
                             &mut pgp_manager,
                             force,
                             &mut poll_shutdown,
@@ -149,7 +157,8 @@ async fn main() -> Result<ExitCode> {
                 }
                 match action {
                     | UnlockAction::Run(command) => {
-                        let executor = CommandExecutor::new(&command, &environment, &profile.env.keep);
+                        let executor =
+                            CommandExecutor::new(&command, &environment, &profile.env.keep, &secret_source_env_vars);
                         executor.execute(timeout, &mut shutdown_rx).await
                     },
                     | UnlockAction::Print => {
@@ -205,13 +214,29 @@ async fn main() -> Result<ExitCode> {
                 .with_context(|| format!("Profile '{}' has no sealed files", profile_name))?;
             let manager = crate::sealed::SealedFileManager::new(manifest.source_directory()?)?;
             let pgp_manager = crate::pgp::PgpManager::default();
+            let mut secret_source_env_vars: Vec<_> =
+                profile.secret_environment_variables().map(str::to_owned).collect();
+            secret_source_env_vars.sort_unstable();
+            secret_source_env_vars.dedup();
 
             let marker = match input {
                 | crate::args::SealInput::Pointer(pointer) => {
-                    manager.seal_path(sealed, &configured_file, &pointer, &pgp_manager)?
+                    manager.seal_path(
+                        sealed,
+                        &configured_file,
+                        &pointer,
+                        &pgp_manager,
+                        &secret_source_env_vars,
+                    )?
                 },
                 | crate::args::SealInput::Direct(plaintext) => {
-                    manager.seal_value(sealed, &configured_file, plaintext.as_str(), &pgp_manager)?
+                    manager.seal_value(
+                        sealed,
+                        &configured_file,
+                        plaintext.as_str(),
+                        &pgp_manager,
+                        &secret_source_env_vars,
+                    )?
                 },
                 | crate::args::SealInput::Stdin => {
                     use std::io::{
@@ -226,7 +251,13 @@ async fn main() -> Result<ExitCode> {
                     std::io::stdin()
                         .read_to_string(&mut plaintext)
                         .context("Failed to read plaintext from stdin")?;
-                    manager.seal_value(sealed, &configured_file, plaintext.as_str(), &pgp_manager)?
+                    manager.seal_value(
+                        sealed,
+                        &configured_file,
+                        plaintext.as_str(),
+                        &pgp_manager,
+                        &secret_source_env_vars,
+                    )?
                 },
             };
             writeln!(std::io::stdout().lock(), "{}", marker).context("Failed to write sealed marker")?;
@@ -330,13 +361,23 @@ struct Environment {
 }
 
 impl Environment {
-    fn load(profile: &manifest::ManifestProfile) -> Result<Self> {
+    fn load(profile: &manifest::ManifestProfile, removed_env_vars: &[String]) -> Result<Self> {
         let mut environment = Self::default();
         for source in &profile.env.from {
-            let value = Zeroizing::new(source.inner.resolve()?);
+            let value = Zeroizing::new(source.inner.resolve(removed_env_vars)?);
             environment.extend_from(&value)?;
         }
         Ok(environment)
+    }
+
+    fn remove_secret_sources(&mut self, names: &[String]) {
+        #[cfg(windows)]
+        self.values
+            .retain(|name, _| !names.iter().any(|source| source.eq_ignore_ascii_case(name)));
+        #[cfg(not(windows))]
+        for name in names {
+            self.values.remove(name);
+        }
     }
 
     fn insert(&mut self, name: String, value: String) -> Result<()> {
@@ -388,6 +429,7 @@ struct CommandExecutor<'a> {
     command: &'a args::ChildCommand,
     environment: &'a Environment,
     keep_env_vars: &'a Option<Vec<String>>,
+    sealed_secret_env_vars: &'a [String],
 }
 
 impl<'a> CommandExecutor<'a> {
@@ -395,11 +437,13 @@ impl<'a> CommandExecutor<'a> {
         command: &'a args::ChildCommand,
         environment: &'a Environment,
         keep_env_vars: &'a Option<Vec<String>>,
+        sealed_secret_env_vars: &'a [String],
     ) -> Self {
         Self {
             command,
             environment,
             keep_env_vars,
+            sealed_secret_env_vars,
         }
     }
 
@@ -466,38 +510,34 @@ impl<'a> CommandExecutor<'a> {
     }
 
     fn configure_env(&self, command: &mut tokio::process::Command) -> Result<()> {
-        match self.keep_env_vars {
-            | None => {
-                for (key, value) in self.environment.iter() {
-                    command.env(key, value.as_str());
-                }
-            },
-            | Some(patterns) => {
-                command.env_clear();
+        if let Some(patterns) = self.keep_env_vars {
+            command.env_clear();
 
-                let compiled_patterns: Result<Vec<regex::Regex>, _> = patterns
-                    .iter()
-                    .map(|pattern| {
-                        regex::Regex::new(pattern)
-                            .with_context(|| format!("Invalid regex pattern in env.keep: '{}'", pattern))
-                    })
-                    .collect();
+            let compiled_patterns: Result<Vec<regex::Regex>, _> = patterns
+                .iter()
+                .map(|pattern| {
+                    regex::Regex::new(pattern)
+                        .with_context(|| format!("Invalid regex pattern in env.keep: '{}'", pattern))
+                })
+                .collect();
 
-                let compiled_patterns = compiled_patterns?;
+            let compiled_patterns = compiled_patterns?;
 
-                for (env_key, env_value) in std::env::vars_os() {
-                    for pattern in &compiled_patterns {
-                        if env_key.to_str().is_some_and(|key| pattern.is_match(key)) {
-                            command.env(&env_key, &env_value);
-                            break;
-                        }
+            for (env_key, env_value) in std::env::vars_os() {
+                for pattern in &compiled_patterns {
+                    if env_key.to_str().is_some_and(|key| pattern.is_match(key)) {
+                        command.env(&env_key, &env_value);
+                        break;
                     }
                 }
+            }
+        }
 
-                for (key, value) in self.environment.iter() {
-                    command.env(key, value.as_str());
-                }
-            },
+        for variable in self.sealed_secret_env_vars {
+            command.env_remove(variable);
+        }
+        for (key, value) in self.environment.iter() {
+            command.env(key, value.as_str());
         }
         Ok(())
     }
@@ -521,7 +561,8 @@ mod tests {
         let command = args::ChildCommand::new("sh".to_string(), vec!["-c".to_string(), "exit 7".to_string()])?;
         let environment = Environment::default();
         let keep_env_vars = None;
-        let executor = CommandExecutor::new(&command, &environment, &keep_env_vars);
+        let sealed_secret_env_vars = Vec::new();
+        let executor = CommandExecutor::new(&command, &environment, &keep_env_vars, &sealed_secret_env_vars);
 
         let status = executor.spawn()?.wait().await?;
         assert_eq!(status.code(), Some(7));
@@ -533,7 +574,8 @@ mod tests {
         let command = args::ChildCommand::new("sleep".to_string(), vec!["10".to_string()])?;
         let environment = Environment::default();
         let keep_env_vars = None;
-        let executor = CommandExecutor::new(&command, &environment, &keep_env_vars);
+        let sealed_secret_env_vars = Vec::new();
+        let executor = CommandExecutor::new(&command, &environment, &keep_env_vars, &sealed_secret_env_vars);
         let (_shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
 
         let outcome = executor
@@ -541,6 +583,49 @@ mod tests {
             .await?;
 
         assert!(matches!(outcome, ExecutionOutcome::TimedOut));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_executor_removes_sealed_secret_environment_variables() -> Result<()> {
+        let command = args::ChildCommand::new("sh".to_string(), vec![])?;
+        let environment = Environment::default();
+        let keep_env_vars = None;
+        let sealed_secret_env_vars = vec!["SECENV_TEST_SEALED_SECRET".to_string()];
+        let executor = CommandExecutor::new(&command, &environment, &keep_env_vars, &sealed_secret_env_vars);
+        let mut child = tokio::process::Command::new("sh");
+        child
+            .args(["-c", "[ -z \"${SECENV_TEST_SEALED_SECRET+x}\" ]"])
+            .env("SECENV_TEST_SEALED_SECRET", "must-not-leak");
+
+        executor.configure_env(&mut child)?;
+        assert!(child.spawn()?.wait().await?.success());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_explicit_profile_values_can_reintroduce_secret_sources() -> Result<()> {
+        let command = args::ChildCommand::new("sh".to_string(), vec![])?;
+        let keep_env_vars = None;
+        let secret_source_env_vars = vec!["SECENV_TEST_SEALED_SECRET".to_string()];
+        let mut environment = Environment::default();
+        environment.insert("SECENV_TEST_SEALED_SECRET".to_string(), "from-env-source".to_string())?;
+        environment.remove_secret_sources(&secret_source_env_vars);
+
+        let executor = CommandExecutor::new(&command, &environment, &keep_env_vars, &secret_source_env_vars);
+        let mut child = tokio::process::Command::new("sh");
+        child
+            .args(["-c", "[ -z \"${SECENV_TEST_SEALED_SECRET+x}\" ]"])
+            .env("SECENV_TEST_SEALED_SECRET", "inherited");
+        executor.configure_env(&mut child)?;
+        assert!(child.spawn()?.wait().await?.success());
+
+        environment.insert("SECENV_TEST_SEALED_SECRET".to_string(), "explicit".to_string())?;
+        let executor = CommandExecutor::new(&command, &environment, &keep_env_vars, &secret_source_env_vars);
+        let mut child = tokio::process::Command::new("sh");
+        child.args(["-c", "[ \"$SECENV_TEST_SEALED_SECRET\" = explicit ]"]);
+        executor.configure_env(&mut child)?;
+        assert!(child.spawn()?.wait().await?.success());
         Ok(())
     }
 }

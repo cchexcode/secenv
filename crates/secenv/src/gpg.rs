@@ -57,7 +57,7 @@ impl GpgManager {
         })
     }
 
-    pub(crate) fn export_private_key(&self, spec: &GpgKeySpec) -> Result<String> {
+    pub(crate) fn export_private_key(&self, spec: &GpgKeySpec, removed_env_vars: &[String]) -> Result<String> {
         let mut cmd = Command::new("gpg");
         cmd.args([
             "--export-secret-keys",
@@ -68,6 +68,7 @@ impl GpgManager {
             "export-minimal,export-clean",
             spec.as_str(),
         ]);
+        crate::process::remove_environment_variables(&mut cmd, removed_env_vars);
 
         let mut output = cmd
             .stdin(Stdio::null())
@@ -103,7 +104,12 @@ impl GpgManager {
         Ok(private_key)
     }
 
-    pub(crate) fn decrypt_data(&self, spec: &GpgKeySpec, encrypted_data: &str) -> Result<String> {
+    pub(crate) fn decrypt_data(
+        &self,
+        spec: &GpgKeySpec,
+        encrypted_data: &str,
+        removed_env_vars: &[String],
+    ) -> Result<String> {
         let mut input = tempfile::tempfile().context("Failed to create temporary GPG input")?;
         input
             .write_all(encrypted_data.as_bytes())
@@ -119,6 +125,7 @@ impl GpgManager {
             spec.as_str(),
             "--decrypt",
         ]);
+        crate::process::remove_environment_variables(&mut cmd, removed_env_vars);
 
         let mut output = cmd
             .stdin(Stdio::from(input))

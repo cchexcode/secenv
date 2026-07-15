@@ -33,7 +33,7 @@ version = "0.0.0"  # Must be semver and compatible with the CLI version
 
 profiles.default {
   # Optional: decrypt marked values in HOCON/JSON files while the command runs.
-  # Every file has its own PGP key or Argon2id passphrase from a remote source.
+  # Every file has its own PGP key or Argon2id passphrase from a configured source.
   sealed {
     # Replace these files in place, then restore their exact encrypted bytes.
     files {
@@ -105,7 +105,8 @@ Notes:
 - Relative file and sealed-template paths are resolved from the config file's directory.
 - Use `secenv init` to generate a JSON example file, or write your own in HOCON format.
 - The `version` field is validated against the CLI version. The config cannot be newer than the CLI, and major versions must match.
-- Supported secret sources for PGP private keys: `secret.pgp.literal`, `secret.pgp.file`, `secret.pgp.gpg.fingerprint`, `secret.pgp.gcp.secret` (+ optional `.version`).
+- PGP private keys for ordinary secure variables and temporary files support `literal`, `file`, `env`, `gpg`, `gcp`, and `aws` sources under `secret.pgp`.
+- Sealed-file PGP keys and Argon2id passphrases support the same `literal`, `file`, `env`, `gpg`, `gcp`, and `aws` source forms under the selected algorithm.
 
 ### 2) Unlock variables and manage temporary files
 
@@ -199,7 +200,7 @@ secenv unlock --profile production -- kubectl get pods
 
 ## Sealed HOCON and JSON values
 
-Profiles can decrypt individual string values inside existing HOCON or JSON documents. Each file or template selects PGP or Argon2id/XChaCha20-Poly1305 and loads its own key material from GCP Secret Manager or AWS Secrets Manager. All required secrets are fetched and every document is decrypted and authenticated in zeroized in-memory buffers before any plaintext document is written.
+Profiles can decrypt individual string values inside existing HOCON or JSON documents. Each file or template selects PGP or Argon2id/XChaCha20-Poly1305 and loads its own key material from a literal, file, environment variable, GPG keyring, GCP Secret Manager, or AWS Secrets Manager. All required secrets are loaded and every document is decrypted and authenticated in zeroized in-memory buffers before any plaintext document is written.
 
 Encrypted values use a single-line marker containing a base64-encoded OpenPGP message:
 
@@ -248,11 +249,11 @@ profiles.production.sealed {
   templates {
     "./generated/runtime.conf" {
       source = "./templates/runtime.conf.sealed"
-      secret.pgp.gcp.secret = "projects/myproject/secrets/runtime-pgp-key"
+      secret.pgp.env = "SECENV_RUNTIME_PGP_KEY"
     }
     "./generated/credentials.json" {
       source = "./templates/credentials.json.sealed"
-      secret.argon2id_xchacha20_poly1305.aws.secret = "my-app/credentials-passphrase"
+      secret.argon2id_xchacha20_poly1305.env = "SECENV_CREDENTIALS_PASSPHRASE"
     }
   }
 }
@@ -260,7 +261,30 @@ profiles.production.sealed {
 
 ### Generating sealed values
 
-`secenv seal` selects a configured in-place path or template output path and uses that entry's configured algorithm. PGP entries encrypt with the public portion of a remote secret-backed certificate. Argon2id/XChaCha20-Poly1305 entries derive an encryption key from the remote passphrase.
+`secenv seal` selects a configured in-place path or template output path and uses that entry's configured algorithm. PGP entries encrypt with the public portion of the configured certificate. Argon2id/XChaCha20-Poly1305 entries derive an encryption key from the configured passphrase.
+
+For an `env` source, the configured value is the environment variable name, not the secret itself. PGP sealing needs a public certificate and unlocking needs the corresponding private key; an environment variable containing the private certificate can serve both operations. Password values and multiline PGP key material are read verbatim without trimming. Missing or non-Unicode variables are rejected before plaintext files are written.
+
+All sealed algorithms use the same source forms:
+
+```hocon
+# Inline UTF-8 or base64-encoded key material/password
+secret.pgp.literal.literal = "<key material>"
+secret.argon2id_xchacha20_poly1305.literal.base64 = "<base64 password>"
+
+# File contents or a named environment variable
+secret.pgp.file = "/path/to/private.key"
+secret.argon2id_xchacha20_poly1305.env = "SECENV_SEALED_PASSWORD"
+
+# Private key exported from the local GPG keyring
+secret.pgp.gpg.fingerprint = "1E1BAC706C352094D490D5393F5167F1F3002043"
+
+# Cloud secret managers
+secret.pgp.gcp.secret = "projects/myproject/secrets/pgp-key"
+secret.argon2id_xchacha20_poly1305.aws.secret = "my-app/passphrase"
+```
+
+`gpg` resolves to the exported private-key text and is primarily useful with the PGP algorithm. Other source forms return their exact string value and can be used with either algorithm.
 
 Pass plaintext directly and write only the sealed marker to stdout:
 
@@ -311,7 +335,8 @@ Behavior and constraints:
 
 - A marker must occupy the complete string value. Decrypted values are emitted as strings.
 - A marker's algorithm must match its file's configured secret type; mixed algorithms within one file are rejected.
-- `argon2id_xchacha20_poly1305` uses Argon2id with 19 MiB memory, 2 iterations, and 1 lane to derive a 256-bit key. Its versioned payload contains a random 16-byte salt, random 24-byte nonce, and authenticated XChaCha20-Poly1305 ciphertext. Use a high-entropy remote passphrase.
+- `argon2id_xchacha20_poly1305` uses Argon2id with 19 MiB memory, 2 iterations, and 1 lane to derive a 256-bit key. Its versioned payload contains a random 16-byte salt, random 24-byte nonce, and authenticated XChaCha20-Poly1305 ciphertext. Use a high-entropy passphrase.
+- Environment variables used as any secret source are removed from provider helper processes and child commands run by `secenv unlock`. Defining the same name explicitly in `profiles.<profile>.env.vars` reintroduces it only for the final child. The original value remains in secenv's parent process environment.
 - Unmarked strings and all numbers, booleans, arrays, objects, and null values are preserved.
 - Documents are parsed strictly as HOCON and materialized as canonical JSON, which is valid HOCON. System-environment substitutions such as `${HOME}` are disabled; normal substitutions within the document still resolve.
 - In-place source bytes, formatting, comments, and basic file permissions are restored after execution. Atomic replacement creates a new inode, so original ownership, hard-link identity, ACLs, extended attributes, and timestamps are not guaranteed to be preserved.
@@ -335,13 +360,13 @@ profiles = {
     sealed = {                     # optional inline HOCON/JSON decryption
       files = {                    # optional in-place files
         <path> = {
-          secret = { pgp|argon2id_xchacha20_poly1305 = { gcp|aws = { ... } } }
+          secret = { pgp|argon2id_xchacha20_poly1305 = { literal|file|env|gpg|gcp|aws = ... } }
         }
       },
       templates = {                # optional temporary outputs
         <output> = {
           source = <source>,
-          secret = { pgp|argon2id_xchacha20_poly1305 = { gcp|aws = { ... } } }
+          secret = { pgp|argon2id_xchacha20_poly1305 = { literal|file|env|gpg|gcp|aws = ... } }
         }
       }
     },
@@ -369,7 +394,8 @@ profiles.<profile>.files {
   "/path/to/secure.key".secure {
     # Use any of the same PGP secret sources as environment variables
     secret.pgp.file = "/path/to/private.key"
-    # or secret.pgp.literal, secret.pgp.gpg.fingerprint, secret.pgp.gcp.secret
+    # or secret.pgp.literal, secret.pgp.env, secret.pgp.gpg.fingerprint,
+    # secret.pgp.gcp, or secret.pgp.aws
     
     value.literal = "-----BEGIN PGP MESSAGE-----..."
     # or value.base64 = "<base64-encoded-ASCII-armored-message>"
@@ -400,10 +426,16 @@ profiles.<profile>.env.vars {                          # required
     # OR
     # secret.pgp.file = "/path/to/private.key"
     # OR
+    # secret.pgp.env = "SECENV_PGP_KEY"
+    # OR
     # secret.pgp.gpg.fingerprint = "<fingerprint>"
     # OR
     # secret.pgp.gcp.secret = "projects/<project>/secrets/<name>"
     # secret.pgp.gcp.version = "latest"  # optional
+    # OR
+    # secret.pgp.aws.secret = "<secret-name-or-arn>"
+    # secret.pgp.aws.version = "AWSCURRENT"  # optional
+    # secret.pgp.aws.region = "us-east-1"    # optional
 
     # Encrypted value to decrypt (ASCII-armored PGP message)
     value.literal = "-----BEGIN PGP MESSAGE-----..."
@@ -444,6 +476,7 @@ Behavior:
 - With `COMMAND`, executes it with variables set and temporary files created. Files are automatically cleaned up after the command completes.
 - With `--timeout`, attempts to terminate and reap the immediate child after the given number of seconds, cleans up plaintext files, and exits 124 when termination and cleanup succeed.
 - If `env.keep` is set in the profile, the child environment is cleared first and only host variables matching any regex in `keep` are preserved; otherwise, the full host environment is kept.
+- Environment variables configured as secret sources are removed from provider helpers and the child environment unless explicitly reintroduced through `env.vars` for the final child.
 - Temporary files defined in `profiles.<profile>.files` are created before command execution:
   - Parent directories are automatically created if they don't exist
   - If a file already exists, the command fails unless `--force` is specified
@@ -452,7 +485,7 @@ Behavior:
 - Sealed in-place files and template outputs exist in decrypted form only while `unlock` is active and are restored or removed before it exits.
 
 ### seal
-Encrypt a value using the remote PGP key or Argon2id passphrase configured for one sealed file.
+Encrypt a value using the PGP key or Argon2id passphrase configured for one sealed file.
 
 ```bash
 secenv seal --for <configured-path> [VALUE] [OPTIONS]
